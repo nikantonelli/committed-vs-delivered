@@ -38,7 +38,8 @@ Ext.define("committed-vs-delivered", {
             timeboxType: Constants.TIMEBOX_TYPE_ITERATION,
             timeboxCount: 5,
             planningWindow: 2,
-            currentTimebox: true
+            currentTimebox: true,
+            showPoints: true
         }
     },
 
@@ -179,7 +180,7 @@ Ext.define("committed-vs-delivered", {
                             text: 'Export to CSV...',
                             handler: function() {
                                 var csvText = CArABU.technicalservices.FileUtilities.convertDataArrayToCSVText(this.currentData, this.getExportFieldsHash());
-                                CArABU.technicalservices.FileUtilities.saveCSVToFile(csvText, 'comitted.csv');
+                                CArABU.technicalservices.FileUtilities.saveCSVToFile(csvText, 'committed.csv');
                             },
                             scope: this
                         }]
@@ -377,7 +378,7 @@ Ext.define("committed-vs-delivered", {
         var timeboxNames = [];
         var plannedCommitted = [];
         var plannedDelivered = [];
-        var unplannedComitted = [];
+        var unplannedCommitted = [];
         var unplannedDelivered = [];
         this.currentData = [];
         _.each(sortedData, function(datum, index, collection) {
@@ -405,15 +406,15 @@ Ext.define("committed-vs-delivered", {
                     else {
                         this.currentData.push(artifact.data);
                         if (artifact.get('Planned')) {
-                            pc++; // Committed and planned
+                            pc += this.getSetting('showPoints')? artifact.get('PlanEstimate'):1; // Committed and planned
                             if (artifact.get('Delivered')) {
-                                pd++ // Planned and delivered
+                                pd += this.getSetting('showPoints')? artifact.get('PlanEstimate'):1;
                             }
                         }
                         else {
-                            uc++; // Comitted and unplanned 
+                            uc += this.getSetting('showPoints')? artifact.get('PlanEstimate'):1;
                             if (artifact.get('Delivered')) {
-                                ud++ // Unplanned and delivered
+                                ud += this.getSetting('showPoints')? artifact.get('PlanEstimate'):1;
                             }
                         }
                     }
@@ -421,11 +422,11 @@ Ext.define("committed-vs-delivered", {
             }
             plannedCommitted.push(pc);
             plannedDelivered.push(pd);
-            unplannedComitted.push(uc);
+            unplannedCommitted.push(uc);
             unplannedDelivered.push(ud);
         }, this);
 
-        var title = "Stories";
+        var title = this.getSetting('showPoints')?"Story Points":"Stories";
         if (this.isPiTypeSelected()) {
             title = this.lowestPiType.get('Name') + 's';
         }
@@ -489,7 +490,7 @@ Ext.define("committed-vs-delivered", {
                         y: -20,
                         overflow: 'justify'
                     },
-                    data: unplannedComitted,
+                    data: unplannedCommitted,
                     stack: 0,
                     legendIndex: 2,
                     name: Constants.UNPLANNED
@@ -687,6 +688,7 @@ Ext.define("committed-vs-delivered", {
         });
         var typeStoreData = [
             { name: 'User Story', value: 'HierarchicalRequirement' },
+            { name: 'Defect', value: 'Defect' },
         ];
         // Called from getSettingsFields which is invoked before launch sets up the lowestPiType. Handle
         // this case.
@@ -811,6 +813,24 @@ Ext.define("committed-vs-delivered", {
                             this.updateSettingsValues({
                                 settings: {
                                     currentTimebox: newValue
+                                }
+                            });
+                        }
+                    }
+                }
+            }, {
+                xtype: 'rallycheckboxfield',
+                name: 'showPoints',
+                value: this.getSetting('showPoints'),
+                fieldLabel: 'Use Story Points',
+                labelWidth: 150,
+                listeners: {
+                    scope: this,
+                    change: function(field, newValue, oldValue) {
+                        if (newValue != oldValue) {
+                            this.updateSettingsValues({
+                                settings: {
+                                    showPoints: newValue
                                 }
                             });
                         }
