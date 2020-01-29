@@ -35,7 +35,7 @@ Ext.define("committed-vs-delivered", {
     config: {
         defaultSettings: {
             artifactType: 'HierarchicalRequirement',
-            timeboxType: Constants.TIMEBOX_TYPE_ITERATION,
+            timeboxType: Constants.TIMEBOX_TYPE_RELEASE,
             timeboxCount: 5,
             planningWindow: 2,
             currentTimebox: true,
@@ -427,6 +427,8 @@ Ext.define("committed-vs-delivered", {
         }, this);
 
         var title = this.getSetting('showPoints')?"Story Points":"Stories";
+        var yAxisTitle = this.getSetting('showPoints')?Constants.Y_AXIS_TITLE_POINT:Constants.Y_AXIS_TITLE_COUNT;
+
         if (this.isPiTypeSelected()) {
             title = this.lowestPiType.get('Name') + 's';
         }
@@ -476,7 +478,7 @@ Ext.define("committed-vs-delivered", {
                 yAxis: {
                     allowDecimals: false,
                     title: {
-                        text: Constants.Y_AXIS_TITLE
+                        text: yAxisTitle
                     }
                 }
             },

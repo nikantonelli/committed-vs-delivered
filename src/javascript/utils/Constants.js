@@ -6,7 +6,8 @@ Ext.define('Constants', {
         COMMITTED: 'Committed',
         DELIVERED: 'Delivered',
         IN_PROGRESS: ' (In-Progress)',
-        Y_AXIS_TITLE: 'Count',
+        Y_AXIS_TITLE_COUNT: 'Count',
+        Y_AXIS_TITLE_POINT: 'Points',
         APP_RESERVED_HEIGHT: 60,
         ALWAYS_SELECTED_FIELDS: [
             'FormattedID',
