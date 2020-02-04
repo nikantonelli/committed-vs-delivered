@@ -5,6 +5,7 @@ Ext.define('Constants', {
         UNPLANNED: 'Unplanned',
         COMMITTED: 'Committed',
         DELIVERED: 'Delivered',
+        EXCEPTION: 'Exception',
         IN_PROGRESS: ' (In-Progress)',
         Y_AXIS_TITLE_COUNT: 'Count',
         Y_AXIS_TITLE_POINT: 'Points',
@@ -41,6 +42,7 @@ Ext.define('Constants', {
         TIMEBOX_TYPE_RELEASE: 'Release',
         TIMEBOX_TYPE_ITERATION_LABEL: 'Iteration',
         TIMEBOX_TYPE_RELEASE_LABEL: 'Release',
-        UNPLANNED_DESCRIPTION: 'added to {timebox} more than {days} days after start'
+        UNPLANNED_DESCRIPTION: 'added to {timebox} more than {days} days after start',
+        EXCEPTION_DESCRIPTION: 'accepted before start, or more than {days} after end of {timebox}'
     }
 });
