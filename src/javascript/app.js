@@ -322,7 +322,9 @@ Ext.define("committed-vs-delivered", {
                                     fetch: this.getFieldsFromButton(),
                                     autoLoad: false,
                                     enablePostGet: true,
-                                    filters: filters
+                                    filters: filters,
+                                    pageSize: 2000,
+                                    limit: Infinity
                                 });
                                 return artifactStore.load().then({
                                     scope: this,

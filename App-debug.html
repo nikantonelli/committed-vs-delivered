@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>committed-vs-delivered-1.2.3</title>
+    <!--  (c) 2017 CA Technologies.  All Rights Reserved. -->
+    <!--  Build Date: Fri Mar 27 2020 09:20:14 GMT+0000 (Greenwich Mean Time) -->
+    
+    <script type="text/javascript">
+        var APP_BUILD_DATE = "Fri Mar 27 2020 09:20:14 GMT+0000 (Greenwich Mean Time)";
+    </script>
+    
+    <script type="text/javascript" src="https://rally1.rallydev.com/apps/2.1/sdk-debug.js"></script>
+    <!-- our highcharts (needed so that we can add patterns) 
+    <script type="text/javascript" src="/apps/2.1/lib/analytics/analytics-all.js"></script>
+    -->
+
+    <script type="text/javascript">
+        Rally.onReady(function() {
+            Rally.loadScripts(["node_modules/@agile-central-technical-services/utils-shared-views/index.js","node_modules/@agile-central-technical-services/utils-ancestor-pi-app-filter/index.js","node_modules/@agile-central-technical-services/utils-ancestor-pi-inline-filter/index.js","node_modules/@agile-central-technical-services/utils-field-picker/index.js","node_modules/file-saver/FileSaver.min.js","node_modules/@agile-central-technical-services/utils-file-utils/index.js","src/javascript/utils/Constants.js","src/javascript/utils/Overrides.js","src/javascript/app.js"],
+	            function() {
+	                Rally.launchApp('committed-vs-delivered', {
+	                    name: 'committed-vs-delivered'
+	                })
+	            }, true);
+        });
+    </script>
+<link rel="stylesheet" type="text/css" href="src/style/app.css">
+
+</head>
+<body></body>
+</html>
