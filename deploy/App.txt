@@ -1,0 +1,2542 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>committed-vs-delivered-1.2.3</title>
+    <!--  (c) 2017 CA Technologies.  All Rights Reserved. -->
+    <!--  Build Date: Fri Apr 17 2020 15:46:12 GMT+0100 (British Summer Time) -->
+
+    <script type="text/javascript">
+        var APP_BUILD_DATE = "Fri Apr 17 2020 15:46:12 GMT+0100 (British Summer Time)";
+        var CHECKSUM = 163127739213;
+    </script>
+
+    <script type="text/javascript" src="/apps/2.1/sdk.js"></script>
+    <!-- our highcharts (needed so that we can add patterns)
+    <script type="text/javascript" src="/apps/2.1/lib/analytics/analytics-all.js"></script>
+    -->
+
+
+    <script type="text/javascript">
+        Rally.onReady(function() {
+             
+Ext.override(Rally.ui.gridboard.SharedViewComboBox, {
+    /**
+     * This override fixes a bug in the SharedViewComboBox which prevents a newly created
+     * view from appearing in the view picker until after an app reload
+     */
+    _isViewPreference: function(record) {
+        return record.self.typePath === 'preference' &&
+            record.get('Type') === 'View' &&
+            // This is fix. Must use '==' not '===' for this to return true
+            record.get('AppId') == this.getContext().getAppId();
+    },
+
+    /**
+     * This override allows the `enableUrlSharing` option to work.
+     * Must override `window.location` with `parent.location`.
+     */
+    getSharedViewParam: function() {
+        var hash = parent.location.hash,
+            matches = hash.match(/sharedViewId=(\d+)/);
+
+        return matches && matches[1];
+    },
+
+    /**
+     * Override to avoid a race condition when restoring columns when using
+     * `enableUrlSharing`
+     * _ensureLatestView is called out of the constructor after initComponent before store.load(), but store.load() is called immediately after
+     * by the parent combobox. The asynchronous store.model.load() here will race with store.load() invoked by the parent. If
+     * the store.load returns first, this function would miss the load event and never apply the latest view columns.
+     * 
+     * Ensure we don't miss the store.load() event by registering an event handler now (before the parent calls store.load()) and
+     * that handler can act on the store.model.load() promise when it resolves. This allows both loads to proceed in parallel without
+     * possibly missing the load event.
+     */
+    _ensureLatestView: function(state) {
+        if (state.objectId && state.versionId) {
+            var modelLoadDeferred = Ext.create('Deft.Deferred');
+            this.store.model.load(state.objectId, {
+                fetch: ['VersionId', 'Value'],
+                success: function(record) {
+                    modelLoadDeferred.resolve(record);
+                }
+            });
+            this.store.on('load', function() {
+                modelLoadDeferred.promise.then({
+                    success: function(record) {
+                        if (record && record.get('VersionId') !== state.versionId) {
+                            this._applyView(this._decodeValue(record));
+                        }
+                    },
+                    scope: this
+                })
+            }, this, { single: true });
+        }
+    },
+})
+
+Ext.define('Utils.AncestorPiAppFilter', {
+    alias: 'plugin.UtilsAncestorPiAppFilter',
+    mixins: [
+        'Ext.AbstractPlugin',
+        'Rally.Messageable'
+    ],
+    extend: 'Ext.Component',
+
+    statics: {
+        RENDER_AREA_ID: 'utils-ancestor-pi-app-filter'
+    },
+
+    config: {
+        /**
+         * @cfg {Boolean}
+         * The id of the component where the plugin will render its controls
+         */
+        renderAreaId: 'utils-ancestor-pi-app-filter',
+
+        /**
+         * @cfg {Boolean}
+         * Set to true to indicate that this component is a publisher of events
+         * to other apps using this plugin
+         */
+        publisher: false,
+
+        /**
+         * @cfg {Boolean}
+         * Set to false to prevent the '-- None --' selection option if your app can't support
+         * querying by a null ancestor (e.g. Lookback _ItemHierarchy)
+         */
+        allowNoEntry: true,
+
+        /**
+         * @cfg {Object}
+         * Config applied to the app settings components
+         */
+        settingsConfig: {},
+
+        /**
+         * @cfg {String}
+         * Label of the Portfolio Item Type picker
+         */
+        ancestorLabel: 'With ancestor',
+
+        /**
+         * @cfg {Number}
+         * Width of the Portfolio Item Type picker label
+         */
+        ancestorLabelWidth: 110,
+
+        /**
+         * @cfg {String}
+         * Label of the Portfolio Item Type picker when shown with the ancestor filter
+         */
+        ownerLabel: 'and owned by',
+
+        /**
+         * @cfg {String}
+         * Label of the Portfolio Item Type picker when shown by itself
+         */
+        ownerOnlyLabel: 'Owned by',
+
+        /**
+         * @cfg {Number}
+         * Width of the Portfolio Item Type picker label
+         */
+        ownerLabelWidth: 110,
+
+
+        /**
+         * @cfg {Number}
+         * Style of the Portfolio Item Type picker label
+         */
+        labelStyle: 'font-size: medium',
+
+        /**
+         * @cfg {Number}
+         * Minimum width for single row layout
+         */
+        singleRowMinWidth: 840
+    },
+
+    portfolioItemTypes: [],
+    readyDeferred: null,
+    piTypesDeferred: null,
+    isSubscriber: false,
+    changeSubscribers: [],
+    publishedValue: {},
+
+    constructor: function(config) {
+        this.callParent(arguments);
+        this._setupPubSub();
+        Ext.tip.QuickTipManager.init();
+    },
+
+    initComponent: function() {
+        this.callParent(arguments);
+        this.addEvents('ready', 'select');
+    },
+
+    init: function(cmp) {
+        this.cmp = cmp;
+
+        this.cmp.on('resize', this._onCmpResize, this);
+
+        // Get the area where plugin controls will render
+        this.renderArea = this.cmp.down('#' + this.renderAreaId);
+
+        // Extend app settings fields
+        var cmpGetSettingsFields = this.cmp.getSettingsFields;
+        this.cmp.getSettingsFields = function() {
+            return this._getSettingsFields(cmpGetSettingsFields.apply(cmp, arguments));
+        }.bind(this);
+
+        // Extend app default settings fields
+        var appDefaults = this.cmp.defaultSettings;
+        appDefaults['Utils.AncestorPiAppFilter.enableAncestorPiFilter2'] = false;
+        appDefaults['Utils.AncestorPiAppFilter.projectScope'] = 'current';
+        this.cmp.setDefaultSettings(appDefaults);
+
+        // Add the control components then fire ready
+        this._addControlCmp().then({
+            scope: this,
+            success: function() {
+                this._setReady()
+            }
+        });
+    },
+
+    notifySubscribers: function() {
+        var data = this._getValue();
+        _.each(this.changeSubscribers, function(subscriberName) {
+            this.publish(subscriberName, data);
+        }, this);
+    },
+
+    // Return a proimse that resolves to a filter (or null) after both:
+    // - the component has finished restoring its state and has an initial value.
+    // - portfolio item types have been loaded
+    getFilterForType: function(type) {
+        var filter;
+
+        var modelName = type.toLowerCase();
+        var currentValues = this._getValue();
+        if (currentValues.piTypePath) {
+            var selectedPiTypePath = currentValues.piTypePath
+            var selectedRecord = currentValues.isPiSelected;
+            var selectedPi = currentValues.pi;
+            var pisAbove = this._piTypeAncestors(modelName, selectedPiTypePath);
+            if (selectedRecord && selectedPi != null && pisAbove != null) {
+                var property;
+                property = this._propertyPrefix(modelName, pisAbove);
+                if (property) {
+                    filter = new Rally.data.wsapi.Filter({
+                        property: property,
+                        value: selectedPi
+                    });
+
+                }
+            }
+            else if (selectedPi != null) {
+                // Filter out any items of this type because the ancestor pi filter is
+                // enabled, but this type doesn't have any pi ancestor types
+                filter = new Rally.data.wsapi.Filter({
+                    property: 'ObjectID',
+                    value: 0
+                })
+            }
+        }
+
+        return filter;
+    },
+
+    getIgnoreProjectScope: function() {
+        return this._getValue().ignoreProjectScope;
+    },
+
+    _setupPubSub: function() {
+        if (this.publisher) {
+            this.subscribe(this, 'registerChangeSubscriber', function(subscriberName) {
+                // Register new unique subscribers
+                if (!_.contains(this.changeSubscribers, subscriberName)) {
+                    this.changeSubscribers.push(subscriberName)
+                }
+                this.publish(subscriberName, this._getValue());
+            }, this);
+            // Ask any existing subscribers to re-register
+            this.publish('reRegisterChangeSubscriber');
+        }
+        else {
+            this.subscriberEventName = Rally.getApp().getAppId() + this.$className;
+            // Subscribe to a channel dedicated to this app
+            this.subscribe(this, this.subscriberEventName, function(data) {
+                if (this.intervalTimer) {
+                    clearInterval(this.intervalTimer);
+                    delete this.intervalTimer;
+                }
+                if (!this.isSubscriber) {
+                    this.isSubscriber = true;
+                    this._hideControlCmp();
+                }
+                this.publishedValue = data;
+                this._onSelect();
+            }, this);
+            // Attempt to register with a publisher (if one exists)
+            this.publish('registerChangeSubscriber', this.subscriberEventName);
+            this.intervalTimer = setInterval(function() {
+                this.publish('registerChangeSubscriber', this.subscriberEventName);
+            }.bind(this), 500);
+            this.subscribe(this, 'reRegisterChangeSubscriber', function() {
+                this.publish('registerChangeSubscriber', this.subscriberEventName);
+            }, this);
+        }
+    },
+
+    _getValue: function() {
+        var result = {};
+        if (this._isSubscriber()) {
+            result = this.publishedValue || {};
+        }
+        else {
+            if (this.piTypeSelector) {
+                var selectedPiType = this.piTypeSelector.getRecord();
+                if (selectedPiType) {
+                    var selectedPiTypePath = selectedPiType.get('TypePath');
+                    var selectedRecord = this.piSelector.getRecord();
+                    var selectedPi = this.piSelector.getValue();
+                    _.merge(result, {
+                        piTypePath: selectedPiTypePath,
+                        isPiSelected: !!selectedRecord,
+                        pi: selectedPi
+                    });
+                }
+            }
+            result.ignoreProjectScope = this._ignoreProjectScope();
+        }
+        return result;
+    },
+
+    _setReady: function() {
+        this.ready = true;
+        this.fireEvent('ready', this);
+    },
+
+    _onSelect: function() {
+        if (this.ready) {
+            this.fireEvent('select', this);
+        }
+    },
+
+    _getSettingsFields: function(fields) {
+        var currentSettings = Rally.getApp().getSettings();
+        if (!currentSettings.hasOwnProperty('Utils.AncestorPiAppFilter.projectScope')) {
+            currentSettings['Utils.AncestorPiAppFilter.projectScope'] = 'user'
+        }
+        var pluginSettingsFields = [{
+                xtype: 'rallycheckboxfield',
+                id: 'Utils.AncestorPiAppFilter.enableAncestorPiFilter2',
+                name: 'Utils.AncestorPiAppFilter.enableAncestorPiFilter2',
+                fieldLabel: 'Filter artifacts by ancestor portfolio item',
+            }, {
+                xtype: 'rallyportfolioitemtypecombobox',
+                id: 'Utils.AncestorPiAppFilter.defaultPiType',
+                name: 'Utils.AncestorPiAppFilter.defaultPiType',
+                fieldLabel: "Default Portfolio Item type",
+                valueField: 'TypePath',
+                allowNoEntry: false,
+                defaultSelectionPosition: 'last',
+                // Disable the preference enabled combo box plugin so that this control value is app specific
+                plugins: [],
+            },
+            {
+                xtype: 'radiogroup',
+                fieldLabel: 'Show artifacts from',
+                columns: 1,
+                vertical: true,
+                allowBlank: false,
+                items: [{
+                    boxLabel: "User's current project(s).",
+                    name: 'Utils.AncestorPiAppFilter.projectScope',
+                    inputValue: 'current',
+                    checked: 'current' === currentSettings['Utils.AncestorPiAppFilter.projectScope']
+                }, {
+                    boxLabel: "All projects in workspace.",
+                    name: 'Utils.AncestorPiAppFilter.projectScope',
+                    inputValue: 'workspace',
+                    checked: 'workspace' === currentSettings['Utils.AncestorPiAppFilter.projectScope']
+                }, {
+                    boxLabel: 'User selectable (either current project(s) or all projects in workspace).',
+                    name: 'Utils.AncestorPiAppFilter.projectScope',
+                    inputValue: 'user',
+                    checked: 'user' === currentSettings['Utils.AncestorPiAppFilter.projectScope']
+                }, ],
+                listeners: {
+                    scope: this,
+                    change: function(group, newValue) {
+                        return;
+                    }
+                }
+            }
+        ];
+        pluginSettingsFields = _.map(pluginSettingsFields, function(pluginSettingsField) {
+            return _.merge(pluginSettingsField, this.settingsConfig)
+        }, this);
+        // apply any settings config to each field added by the plugin
+        return pluginSettingsFields.concat(fields || []);
+    },
+
+    // Requires that app settings are available (e.g. from 'beforelaunch')
+    _addControlCmp: function() {
+        var deferred = Ext.create('Deft.Deferred');
+        var controlsLayout = {
+            type: 'hbox',
+            align: 'middle',
+            defaultMargins: '0 10 0 0'
+        };
+        var ownerLabelWidth = this.ownerLabelWidth;
+        if (this.cmp.getWidth() < this.singleRowMinWidth) {
+            controlsLayout = 'vbox';
+            ownerLabelWidth = this.ancestorLabelWidth;
+        }
+        var scopeControlByItself = false;
+        if (this._showAncestorFilter() == false && this._showIgnoreProjectScopeControl() == true) {
+            scopeControlByItself = true;
+        }
+        var controls = {
+            xtype: 'container',
+            id: 'controlsArea',
+            overflowX: 'auto',
+            layout: {
+                type: 'hbox',
+                align: 'top'
+            },
+            items: [{
+                xtype: 'container',
+                id: 'pubSubIndicatorArea',
+                width: 25,
+                padding: '6 5 0 0',
+                hidden: !this.publisher && !this._isSubscriber(),
+                items: [{
+                        xtype: 'component',
+                        id: 'publisherIndicator',
+                        html: '<span class="icon-bullhorn icon-large"></span>',
+                        hidden: !this.publisher
+                    },
+                    {
+                        xtype: 'component',
+                        id: 'subscriberIndicator',
+                        html: '<span class="icon-link icon-large"></span>',
+                        hidden: !this._isSubscriber()
+                    },
+                ]
+            }, {
+                xtype: 'container',
+                id: 'filtersArea',
+                layout: controlsLayout,
+                items: [{
+                    xtype: 'container',
+                    id: 'ancestorFilterArea',
+                    layout: {
+                        type: 'hbox',
+                        align: 'middle'
+                    },
+                    items: [{
+                            xtype: 'container',
+                            id: 'piTypeArea',
+                            layout: {
+                                type: 'hbox',
+                                align: 'middle'
+                            },
+                        },
+                        {
+                            xtype: 'container',
+                            id: 'piSelectorArea',
+                            layout: {
+                                type: 'hbox',
+                                align: 'middle',
+                                padding: '0 0 0 5'
+                            },
+                        }
+                    ]
+                }, {
+                    xtype: 'container',
+                    id: 'scopeControlArea',
+                    width: 250,
+                    layout: {
+                        type: 'hbox',
+                        align: 'middle'
+                    },
+                    items: [{
+                        xtype: 'rallycombobox',
+                        id: 'ignoreScopeControl',
+                        stateful: true,
+                        stateId: this.cmp.getContext().getScopedStateId('Utils.AncestorPiAppFilter.ignoreProjectScopeControl'),
+                        stateEvents: ['select'],
+                        hidden: this._isSubscriber() || !this._showIgnoreProjectScopeControl(),
+                        displayField: 'text',
+                        valueField: 'value',
+                        labelStyle: this.labelStyle,
+                        labelWidth: ownerLabelWidth,
+                        fieldLabel: scopeControlByItself ? this.ownerOnlyLabel : this.ownerLabel,
+                        // Don't set initial value with this component or it will override the state
+                        storeConfig: {
+                            fields: ['text', 'value'],
+                            data: [{
+                                text: "Current Project(s)",
+                                value: false
+                            }, {
+                                text: "Any Project",
+                                value: true
+                            }]
+                        },
+                        listeners: {
+                            scope: this,
+                            change: function(cmp, newValue) {
+                                this._onSelect();
+                            },
+                        },
+                    }]
+                }]
+            }]
+        }
+
+        if (this.renderArea) {
+            // Without this, the components are clipped on narrow windows
+            this.renderArea.setOverflowXY('auto', 'auto');
+            this.renderArea.add(controls);
+        }
+
+        this._addTooltips();
+
+        // Need to get pi types sorted by ordinal lowest to highest for the filter logic to work
+        Rally.data.util.PortfolioItemHelper.getPortfolioItemTypes().then({
+            scope: this,
+            success: function(data) {
+                this.portfolioItemTypes = data;
+
+                if (!this._isSubscriber() && this._showAncestorFilter()) {
+                    // Now create the pi type selector
+                    this.piTypeSelector = Ext.create('Rally.ui.combobox.PortfolioItemTypeComboBox', {
+                        xtype: 'rallyportfolioitemtypecombobox',
+                        id: 'Utils.AncestorPiAppFilter.piType',
+                        name: 'Utils.AncestorPiAppFilter.piType',
+                        width: 250,
+                        // Disable the preference enabled combo box plugin so that this control value is app specific
+                        plugins: [],
+                        stateful: true,
+                        stateId: this.cmp.getContext().getScopedStateId('Utils.AncestorPiAppFilter.piType'),
+                        stateEvents: ['select'],
+                        fieldLabel: this.ancestorLabel,
+                        labelWidth: this.ancestorLabelWidth,
+                        labelStyle: this.labelStyle,
+                        valueField: 'TypePath',
+                        value: this._defaultPortfolioItemType(),
+                        allowNoEntry: false,
+                        defaultSelectionPosition: 'first',
+                        listeners: {
+                            scope: this,
+                            ready: function(combobox) {
+                                // Unfortunately we cannot use the combobox store of PI types for our filter
+                                // logic because it is sorted by ordinal from highest to lowest so that the
+                                // picker options have a an order familiar to the user.
+
+                                // Don't add the change listener until ready. This prevents us
+                                // from adding and removing the pi selector multiple times during
+                                // startup which causes a null ptr exception in that component
+                                combobox.addListener({
+                                    scope: this,
+                                    change: this._onPiTypeChange
+                                });
+                                this._addPiSelector(combobox.getValue()).then({
+                                    scope: this,
+                                    success: function() {
+                                        deferred.resolve();
+                                    }
+                                })
+                            }
+                        }
+                    });
+                    this.renderArea.down('#piTypeArea').add(this.piTypeSelector);
+                }
+                else {
+                    deferred.resolve();
+                }
+            }
+        });
+        return deferred.promise;
+    },
+
+    _addTooltips: function() {
+        Ext.tip.QuickTipManager.register({
+            target: 'publisherIndicator',
+            //title: 'Publisher Indicator',
+            text: 'This app broadcasts filter settings to any enabled ancestor filtered apps (indicated with <span class="icon-link icon-large"></span>)',
+            showDelay: 50,
+            border: true
+        });
+
+        Ext.tip.QuickTipManager.register({
+            target: 'subscriberIndicator',
+            //title: 'Subscriber Indicator',
+            text: 'This app listens for filter settings from any enabled ancestor filter broadcast app (indicated with <span class="icon-bullhorn icon-large"></span>)',
+            showDelay: 50,
+            border: true
+        });
+    },
+
+    _onCmpResize: function(cmp, width) {
+        var controlsLayout = {
+            type: 'hbox',
+            align: 'middle',
+            defaultMargins: '0 10 0 0'
+        };
+        if (width < this.singleRowMinWidth) {
+            controlsLayout = {
+                type: 'vbox'
+            }
+        }
+        var filtersArea = this.renderArea.down('#filtersArea');
+        if (filtersArea) {
+            var controlsArea = this.renderArea.down('#controlsArea');
+            var filters = filtersArea.removeAll(false);
+            var newFiltersArea = {
+                xtype: 'container',
+                id: 'filtersArea',
+                layout: controlsLayout,
+                items: filters,
+                hidden: filtersArea.isHidden()
+            }
+            controlsArea.remove(filtersArea, false);
+            controlsArea.add(newFiltersArea);
+        }
+    },
+
+    _hideControlCmp: function() {
+        if (this.renderArea) {
+            this.renderArea.down('#pubSubIndicatorArea').show();
+            this.renderArea.down('#subscriberIndicator').show();
+            this.renderArea.down('#filtersArea').hide();
+        }
+    },
+
+    _onPiTypeChange: function(piTypeSelector, newValue, oldValue) {
+        if (newValue) {
+            this._removePiSelector();
+            this._addPiSelector(newValue).then({
+                scope: this,
+                success: function() {
+                    this._setReady()
+                }
+            });
+        }
+    },
+
+    _removePiSelector: function() {
+        this.renderArea.down('#piSelectorArea').removeAll();
+    },
+
+    _addPiSelector: function(piType) {
+        var deferred = Ext.create('Deft.Deferred');
+        this.piSelector = Ext.create('Rally.ui.combobox.ArtifactSearchComboBox', {
+            id: 'Utils.AncestorPiAppFilter.piSelector',
+            width: 250,
+            labelAlign: 'top',
+            storeConfig: {
+                models: piType,
+                autoLoad: true,
+                context: {
+                    project: null
+                }
+            },
+            stateful: true,
+            stateId: this.cmp.getContext().getScopedStateId('Utils.AncestorPiAppFilter.piSelector'),
+            stateEvents: ['select'],
+            valueField: '_ref',
+            allowClear: true,
+            clearValue: null,
+            allowNoEntry: this.allowNoEntry,
+            noEntryValue: '',
+            defaultSelectionPosition: null,
+            listeners: {
+                scope: this,
+                select: function(cmp, records) {
+                    this._onSelect();
+                },
+                ready: function(cmp, records) {
+                    deferred.resolve();
+                }
+            }
+        });
+        // Allow this combobox to save null state (which is default behavior of
+        // stateful mixin, but for some reason was overridden in combobox)
+        Ext.override(this.piSelector, {
+            saveState: function() {
+                var me = this,
+                    id = me.stateful && me.getStateId(),
+                    hasListeners = me.hasListeners,
+                    state;
+
+                if (id) {
+                    state = me.getState() || {}; //pass along for custom interactions
+                    if (!hasListeners.beforestatesave || me.fireEvent('beforestatesave', me, state) !== false) {
+                        Ext.state.Manager.set(id, state);
+                        if (hasListeners.statesave) {
+                            me.fireEvent('statesave', me, state);
+                        }
+                    }
+                }
+            }
+        });
+        this.renderArea.down('#piSelectorArea').add(this.piSelector);
+        return deferred.promise;
+    },
+
+    _showAncestorFilter: function() {
+        return this.cmp.getSetting('Utils.AncestorPiAppFilter.enableAncestorPiFilter2');
+    },
+
+    _showIgnoreProjectScopeControl: function() {
+        return this.cmp.getSetting('Utils.AncestorPiAppFilter.projectScope') == 'user';
+    },
+
+    _ignoreProjectScope: function() {
+        var result = false;
+        if (this._showIgnoreProjectScopeControl()) {
+            // If the control is shown, that values overrides the ignoreScope app setting
+            result = this.renderArea.down('#ignoreScopeControl').getValue();
+        }
+        else if (this.cmp.getSetting('Utils.AncestorPiAppFilter.projectScope') == 'workspace') {
+            result = true;
+        }
+        return result;
+    },
+
+    _isSubscriber: function() {
+        return this.isSubscriber;
+    },
+
+    _defaultPortfolioItemType: function() {
+        return this.cmp.getSetting('Utils.AncestorPiAppFilter.defaultPiType');
+    },
+
+    _propertyPrefix: function(typeName, piTypesAbove) {
+        var property;
+        if (typeName === 'hierarchicalrequirement' || typeName === 'userstory') {
+            property = piTypesAbove[0].get('Name');
+        }
+        else if (typeName === 'defect') {
+            property = 'Requirement.' + piTypesAbove[0].get('Name');
+        }
+        else if (Ext.String.startsWith(typeName, 'portfolioitem')) {
+            property = 'Parent';
+        }
+
+        if (property) {
+            // property already gets us to the lowest pi level above the current type
+            // for each additional level, add a 'Parent' term, except for the last
+            // type in the list which is the currently selected pi type ancestor
+            _.forEach(piTypesAbove.slice(1), function(piType) {
+                property = property + '.Parent';
+            }, this);
+        }
+
+        return property;
+    },
+
+    /**
+     * Return a list of portfolio item types AT or below the selected pi type,
+     * that are an ancestor of the given model, or null if there are no pi type
+     * ancestors for the given model.
+     */
+    _piTypeAncestors: function(modelName, selectedPiTypePath) {
+        var result = null;
+        var selectedPiTypeIndex;
+        var modelNamePiTypeIndex;
+
+        if (_.contains(['hierarchicalrequirement', 'userstory', 'defect'], modelName)) {
+            selectedPiTypeIndex = _.findIndex(this.portfolioItemTypes, function(piType) {
+                return piType.get('TypePath').toLowerCase() === selectedPiTypePath.toLowerCase();
+            });
+            result = this.portfolioItemTypes.slice(0, selectedPiTypeIndex + 1);
+        }
+        else if (Ext.String.startsWith(modelName, 'portfolioitem')) {
+            modelNamePiTypeIndex = _.findIndex(this.portfolioItemTypes, function(piType) {
+                return piType.get('TypePath').toLowerCase() === modelName.toLowerCase();
+            });
+            selectedPiTypeIndex = _.findIndex(this.portfolioItemTypes, function(piType) {
+                return piType.get('TypePath').toLowerCase() === selectedPiTypePath.toLowerCase();
+            });
+
+            if (modelNamePiTypeIndex < selectedPiTypeIndex) {
+                // Don't include the current model pi in the list of ancestors
+                // Include the selcted pi type ancestor
+                result = this.portfolioItemTypes.slice(modelNamePiTypeIndex + 1, selectedPiTypeIndex + 1);
+            }
+        }
+
+        return result;
+    }
+});
+
+/* globals Rally */
+// Fix the PreliminaryEstimate renderer to sort by value
+Rally.ui.renderer.GridEditorFactory.editorRenderers['PreliminaryEstimate'] = function(field) {
+    return {
+        xtype: 'rallyrecordcontexteditor',
+        field: {
+            xtype: 'rallycombobox',
+            allowNoEntry: !field.required,
+            editable: false,
+            name: field.name,
+            storeConfig: {
+                autoLoad: true,
+                model: field.name,
+                remoteFilter: true,
+                sorters: [{
+                    property: "Value"
+                }],
+                listeners: {
+                    load: function() {
+                        return;
+                    }
+                }
+            }
+        }
+    };
+};
+
+Ext.define('Utils.AncestorPiInlineFilter', {
+    override: 'Rally.ui.inlinefilter.QuickFilterPanel',
+    portfolioItemTypes: [],
+    modelName: undefined,
+    customFilterNamePrefix: "AncestorPiInlineFilter.",
+
+    _hasPiAncestor: function(modelName) {
+        return _.contains(['hierarchicalrequirement', 'userstory', 'defect'], modelName) || Ext.String.startsWith(modelName, 'portfolioitem');
+    },
+
+    _pisAbove: function(modelName) {
+        var result = [];
+        if (_.contains(['hierarchicalrequirement', 'userstory', 'defect'], modelName)) {
+            result = this.portfolioItemTypes
+        }
+        else if (Ext.String.startsWith(modelName, 'portfolioitem')) {
+            var startIndex = _.findIndex(this.portfolioItemTypes, function(piType) {
+                return piType.get('TypePath').toLowerCase() === modelName;
+            });
+            if (startIndex >= 0 && startIndex < this.portfolioItemTypes.length - 1) {
+                result = this.portfolioItemTypes.slice(startIndex + 1);
+            }
+        }
+        return result;
+    },
+
+    initComponent: function() {
+        if (!this.dataContext) {
+            this.dataContext = Rally.getApp().getContext().getDataContext();
+        }
+
+        if (this.modelName) {
+            this.modelName = this.modelName.toLowerCase();
+        }
+        var filterFactoryOverrides = {};
+        var additionalFields = []
+        if (this._hasPiAncestor(this.modelName)) {
+            var pisAbove = this._pisAbove(this.modelName);
+            _.each(pisAbove, function(piType) {
+                var typePath = piType.get('TypePath');
+                var customFilterName = this.customFilterNamePrefix + typePath;
+                var displayName = 'Portfolio Item / ' + piType.get('Name');
+                filterFactoryOverrides[customFilterName] = {
+                    xtype: 'ancestorpisearchcombobox',
+                    portfolioItemType: typePath, // The artifact type to search for
+                    piTypesAbove: pisAbove, // List of portfolio item types
+                    artifactTypeName: this.modelName, // The artifact type we are filtering
+                    storeConfig: {
+                        context: this.dataContext,
+                        models: typePath,
+                        autoLoad: true
+                    },
+                    allowNoEntry: true,
+                    noEntryValue: null,
+                    noEntryText: 'No ' + displayName,
+                    emptyText: 'Search ' + displayName + 's...',
+                    allowClear: false,
+                    valueField: 'ObjectUUID', // Must use ObjectUUID to align with the state that is saved by inlinefilterbutton
+                    forceSelection: false
+                };
+                additionalFields.push({
+                    name: customFilterName,
+                    displayName: displayName
+                })
+            }, this);
+
+            // Add the additional fields to the quick filter config
+            _.merge(this.addQuickFilterConfig, {
+                additionalFields: additionalFields
+            }, function(a, b) {
+                if (_.isArray(a)) {
+                    return _.uniq(a.concat(b), 'name') // Strip duplicates by name that can occur from state
+                }
+            });
+
+            // Add the corresponding items to the FilterFieldFactory
+            Ext.override(Rally.ui.inlinefilter.FilterFieldFactory, filterFactoryOverrides);
+        }
+
+        this.callParent(arguments);
+    },
+
+    _createFields: function() {
+        // Strip out the custom filters from this.fields and this.initialFilters
+        this.fields = _.filter(this.fields, function(field) {
+            return this._filterInvalidAncestorFilters(field);
+        }, this);
+        this.initialFilters = _.filter(this.initialFilters, function(filter) {
+            return this._filterInvalidAncestorFilters(filter.name);
+        }, this);
+        this.callParent(arguments);
+    },
+
+    /**
+     * This will exclude any field restored from state that we didn't explicitly add into the Factory
+     * for the current model type. This prevents changes in model types from trying to build an invalid filter
+     * for that new model type.
+     */
+    _filterInvalidAncestorFilters: function(name) {
+        return !Ext.String.startsWith(name, this.customFilterNamePrefix) || Rally.ui.inlinefilter.FilterFieldFactory.hasOwnProperty(name)
+    }
+});
+
+Ext.define('Utils.AncestorPiSearchComboBox', {
+    alias: 'widget.ancestorpisearchcombobox',
+    extend: 'Rally.ui.combobox.ArtifactSearchComboBox',
+
+    parentField: 'PortfolioItem.Parent.',
+
+    artifactTypeName: undefined, // The name of the model that will be filtered
+    piTypesAbove: [],
+    statics: {
+        UUID_REGEX: /([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})/
+    },
+
+    constructor: function(config) {
+        if (config.value) {
+            Ext.merge(config, {
+                storeConfig: {
+                    filters: Rally.data.wsapi.Filter.or([{
+                            property: config.valueField, // Compensate for parent constructor assuming that filter value is OidFromRef
+                            value: config.value
+                        }
+                        /*, {
+                                                property: 'ObjectID',
+                                                operator: '!=',
+                                                value: 0
+                                            }*/
+                    ])
+                }
+            });
+        }
+
+        //this.callSuper(arguments);
+        // Get super super method (skip the extended ArtifactSearchComboBox.constructor()
+        return this.superclass.superclass['constructor'].apply(this, arguments);
+    },
+
+    initComponent: function() {
+        this.on('change', function(cmp, newValue, oldValue) {
+            if (newValue == "") {
+                this.store.load({
+                    filters: []
+                })
+            }
+        }, this)
+        return this.callParent(arguments);
+    },
+
+    setValue: function() {
+        this.callParent(arguments);
+    },
+
+    getFilter: function() {
+
+        var value = this.lastValue;
+        var propertyPrefix = this.propertyPrefix();
+        var filters = []
+        // If the value is a UUID, then use it, otherwise ignore values the user might be typing in
+        if (value && this.statics().UUID_REGEX.test(value)) {
+            filters.push({
+                property: propertyPrefix + ".ObjectUUID",
+                value: value
+            });
+        }
+        else {
+            filters.push({
+                property: propertyPrefix,
+                value: null
+            });
+        }
+        return Rally.data.wsapi.Filter.or(filters);
+    },
+
+    propertyPrefix: function() {
+        var property;
+        // Get the path between the selected artifact and the lowest level PI above it
+        if (this.artifactTypeName === 'hierarchicalrequirement' || this.artifactTypeName === 'userstory') {
+            property = this.piTypesAbove[0].get('Name');
+        }
+        else if (this.artifactTypeName === 'defect') {
+            property = 'Requirement.' + this.piTypesAbove[0].get('Name');
+        }
+        else if (Ext.String.startsWith(this.artifactTypeName, 'portfolioitem')) {
+            property = 'Parent';
+        }
+
+        if (property) {
+            // Now add .Parent for every PI level above the lowest until we get to the
+            // desired PI type
+            _.forEach(this.piTypesAbove, function(piType) {
+                if (piType.get('TypePath').toLowerCase() == this.portfolioItemType.toLowerCase()) {
+                    return false;
+                }
+                else {
+                    property = property + '.Parent'
+                }
+            }, this);
+        }
+
+        return property;
+    }
+});
+
+Ext.define('CA.technicalservices.userutilities.FieldPicker', {
+    alias: 'widget.tsfieldpickerbutton',
+    extend: 'Rally.ui.Button',
+    requires: [
+        'Rally.ui.popover.Popover',
+        'Rally.ui.Button',
+        'Rally.ui.picker.FieldPicker',
+        'Ext.state.Manager'
+    ],
+    toolTipConfig: {
+        html: 'Show Columns',
+        anchor: 'top'
+    },
+    iconCls: 'icon-add-column',
+
+    cls: 'field-picker-btn secondary rly-small',
+
+    alwaysSelectedValues: ['FormattedID', 'Name'], // DragAndDropRank gets added in init if Drag and Drop is enabled for the workspace in the component's context
+
+    fieldBlackList: [],
+
+    fieldPickerConfig: {},
+
+    buttonConfig: {},
+
+    modelNames: ['User'],
+
+    rankingEnabled: false,
+
+    //This does not show the Rank column
+
+    constructor: function(config) {
+        this.config = _.merge({}, this.config || {}, config || {});
+        this.callParent([config]);
+    },
+
+    initComponent: function() {
+
+        if (this.models) {
+            this.on('click', this._createPopover, this);
+            this.callParent(arguments);
+            return;
+        }
+
+        if (this.context && this.modelNames && this.modelNames.length > 0) {
+            Rally.data.ModelFactory.getModels({
+                types: this.modelNames,
+                context: this.context,
+                success: function(models) {
+                    this.models = models;
+                },
+                failure: function(failedParam) {
+                    console.log('failedparam');
+                },
+                scope: this
+            });
+            this.on('click', this._createPopover, this);
+        }
+        else {
+            this.iconCls = 'icon-none';
+            var msg = "Please update the CA.technicalservices.FieldPicker configuration with modelNames and context";
+            this.toolTipConfig = {
+                html: '<div style="color:red;">' + msg + '</div>'
+            };
+            this.on('click', function() { Rally.ui.notify.Notifier.showError({ message: msg }); });
+        }
+        this.callParent(arguments);
+    },
+    getFields: function() {
+        return _.union(this._fields || [], this.alwaysSelectedValues);
+    },
+    _getPickerConfig: function() {
+        var pickerConfig;
+        pickerConfig = _.extend({
+            value: this._fields,
+            fieldBlackList: this.fieldBlackList,
+            alwaysSelectedValues: this.alwaysSelectedValues,
+            context: this.context
+        }, this.fieldPickerConfig);
+
+        return pickerConfig;
+    },
+
+    _createPopover: function(btn) {
+        var popoverTarget = btn.getEl();
+
+        this.popover = Ext.create('Rally.ui.popover.Popover', {
+            target: popoverTarget,
+            placement: ['bottom', 'left', 'top', 'right'],
+            cls: 'field-picker-popover',
+            toFront: Ext.emptyFn,
+            buttonAlign: 'center',
+            title: this.getTitle(),
+            listeners: {
+                destroy: function() {
+                    this.popover = null;
+                },
+                scope: this
+            },
+            buttons: [{
+                    xtype: "rallybutton",
+                    text: 'Apply',
+                    cls: 'field-picker-apply-btn primary rly-small',
+                    listeners: {
+                        click: function() {
+                            this._onApply(this.popover);
+                        },
+                        scope: this
+                    }
+                },
+                {
+                    xtype: "rallybutton",
+                    text: 'Cancel',
+                    cls: 'field-picker-cancel-btn secondary dark rly-small',
+                    listeners: {
+                        click: function() {
+                            this.popover.close();
+                        },
+                        scope: this
+                    }
+                }
+            ],
+            items: [
+                _.extend({
+                    xtype: 'rallyfieldpicker',
+                    cls: 'field-picker',
+                    itemId: 'fieldpicker',
+                    modelTypes: this._getModelTypes(),
+                    alwaysExpanded: true,
+                    width: 200,
+                    emptyText: 'Search',
+                    selectedTextLabel: 'Selected',
+                    availableTextLabel: 'Available',
+                    listeners: {
+                        specialkey: function(field, e) {
+                            if (e.getKey() === e.ESC) {
+                                this.popover.close();
+                            }
+                        },
+                        scope: this
+                    }
+                }, this._getPickerConfig())
+            ]
+        });
+    },
+
+    _getModelTypes: function() {
+        return _.pluck(this._getModels(), 'typePath');
+    },
+
+    _getModels: function() {
+        return _.reduce(this.models, function(accum, model) {
+            if (model.typePath === 'artifact') {
+                accum = accum.concat(model.getArtifactComponentModels());
+            }
+            else {
+                accum.push(model);
+            }
+            return accum;
+        }, []);
+    },
+
+    getTitle: function() {
+        return 'Show Columns';
+    },
+
+    /**
+     * Update the fields displayed. In grid mode this will be the columns displayed. In board mode it will be
+     * the fields on the cards
+     *
+     * @param {String[]|Object[]} fields A list of field names to display
+     * @param {Boolean} true to suspend store load if it will be triggered elsewhere
+     */
+    updateFields: function(fields, suspendLoad) {
+        this._fields = fields;
+        if (this.popover && this.popover.down('rallyfieldpicker')) {
+            this.popover.down('rallyfieldpicker').setValue(fields.join(','));
+        }
+        this.saveState();
+    },
+    getState: function() {
+        return {
+            fields: this._fields
+        };
+    },
+    applyState: function(state) {
+        if (state) {
+            this._fields = state.fields;
+        }
+    },
+    _onApply: function(popover) {
+        var fieldPicker = popover.down('rallyfieldpicker'),
+            fields = _.map(fieldPicker.getValue(), function(field) {
+                return field.get('name');
+            });
+
+        this.updateFields(fields);
+        popover.close();
+
+        this.fireEvent('fieldsupdated', fields);
+    }
+});
+
+/*! @source http://purl.eligrey.com/github/FileSaver.js/blob/master/FileSaver.js */
+var saveAs=saveAs||function(e){"use strict";if(typeof e==="undefined"||typeof navigator!=="undefined"&&/MSIE [1-9]\./.test(navigator.userAgent)){return}var t=e.document,n=function(){return e.URL||e.webkitURL||e},r=t.createElementNS("http://www.w3.org/1999/xhtml","a"),o="download"in r,a=function(e){var t=new MouseEvent("click");e.dispatchEvent(t)},i=/constructor/i.test(e.HTMLElement)||e.safari,f=/CriOS\/[\d]+/.test(navigator.userAgent),u=function(t){(e.setImmediate||e.setTimeout)(function(){throw t},0)},s="application/octet-stream",d=1e3*40,c=function(e){var t=function(){if(typeof e==="string"){n().revokeObjectURL(e)}else{e.remove()}};setTimeout(t,d)},l=function(e,t,n){t=[].concat(t);var r=t.length;while(r--){var o=e["on"+t[r]];if(typeof o==="function"){try{o.call(e,n||e)}catch(a){u(a)}}}},p=function(e){if(/^\s*(?:text\/\S*|application\/xml|\S*\/\S*\+xml)\s*;.*charset\s*=\s*utf-8/i.test(e.type)){return new Blob([String.fromCharCode(65279),e],{type:e.type})}return e},v=function(t,u,d){if(!d){t=p(t)}var v=this,w=t.type,m=w===s,y,h=function(){l(v,"writestart progress write writeend".split(" "))},S=function(){if((f||m&&i)&&e.FileReader){var r=new FileReader;r.onloadend=function(){var t=f?r.result:r.result.replace(/^data:[^;]*;/,"data:attachment/file;");var n=e.open(t,"_blank");if(!n)e.location.href=t;t=undefined;v.readyState=v.DONE;h()};r.readAsDataURL(t);v.readyState=v.INIT;return}if(!y){y=n().createObjectURL(t)}if(m){e.location.href=y}else{var o=e.open(y,"_blank");if(!o){e.location.href=y}}v.readyState=v.DONE;h();c(y)};v.readyState=v.INIT;if(o){y=n().createObjectURL(t);setTimeout(function(){r.href=y;r.download=u;a(r);h();c(y);v.readyState=v.DONE});return}S()},w=v.prototype,m=function(e,t,n){return new v(e,t||e.name||"download",n)};if(typeof navigator!=="undefined"&&navigator.msSaveOrOpenBlob){return function(e,t,n){t=t||e.name||"download";if(!n){e=p(e)}return navigator.msSaveOrOpenBlob(e,t)}}w.abort=function(){};w.readyState=w.INIT=0;w.WRITING=1;w.DONE=2;w.error=w.onwritestart=w.onprogress=w.onwrite=w.onabort=w.onerror=w.onwriteend=null;return m}(typeof self!=="undefined"&&self||typeof window!=="undefined"&&window||this.content);if(typeof module!=="undefined"&&module.exports){module.exports.saveAs=saveAs}else if(typeof define!=="undefined"&&define!==null&&define.amd!==null){define("FileSaver.js",function(){return saveAs})}
+
+/* global Ext CArABU saveAs Blob destroyClickedElement Rally*/
+Ext.define('CArABU.technicalservices.FileUtilities', {
+    singleton: true,
+    saveCSVToFile: function(csv, file_name, type_object) {
+        if (type_object == undefined) {
+            type_object = { type: 'text/csv;charset=utf-8' };
+        }
+        var blob = new Blob([csv], type_object);
+        saveAs(blob, file_name);
+    },
+    saveTextAsFile: function(textToWrite, fileName) {
+        var textFileAsBlob = new Blob([textToWrite], { type: 'text/plain' });
+        var fileNameToSaveAs = fileName;
+
+        var downloadLink = document.createElement("a");
+        downloadLink.download = fileNameToSaveAs;
+        downloadLink.innerHTML = "Download File";
+        if (window.webkitURL != null) {
+            // Chrome allows the link to be clicked
+            // without actually adding it to the DOM.
+            downloadLink.href = window.webkitURL.createObjectURL(textFileAsBlob);
+        }
+        else {
+            // Firefox requires the link to be added to the DOM
+            // before it can be clicked.
+            downloadLink.href = window.URL.createObjectURL(textFileAsBlob);
+            downloadLink.onclick = destroyClickedElement;
+            downloadLink.style.display = "none";
+            document.body.appendChild(downloadLink);
+        }
+        downloadLink.click();
+    },
+    destroyClickedElement: function(event) {
+        document.body.removeChild(event.target);
+    },
+    convertDataArrayToCSVText: function(data_array, requestedFieldHash) {
+
+        var text = '';
+        Ext.each(Object.keys(requestedFieldHash), function(key) {
+            text += requestedFieldHash[key] + ',';
+        });
+        text = text.replace(/,$/, '\n');
+
+        Ext.each(data_array, function(d) {
+            Ext.each(Object.keys(requestedFieldHash), function(key) {
+                if (d[key]) {
+                    if (typeof d[key] === 'object') {
+                        if (d[key].FormattedID) {
+                            text += Ext.String.format("\"{0}\",", d[key].FormattedID);
+                        }
+                        else if (d[key].Name) {
+                            text += Ext.String.format("\"{0}\",", d[key].Name);
+                        }
+                        else if (!isNaN(Date.parse(d[key]))) {
+                            text += Ext.String.format("\"{0}\",", Rally.util.DateTime.formatWithDefaultDateTime(d[key]));
+                        }
+                        else {
+                            text += Ext.String.format("\"{0}\",", d[key].toString());
+                        }
+                    }
+                    else {
+                        text += Ext.String.format("\"{0}\",", d[key]);
+                    }
+                }
+                else {
+                    text += ',';
+                }
+            }, this);
+            text = text.replace(/,$/, '\n');
+        }, this);
+        return text;
+    },
+    _getCSVFromWsapiBackedGrid: function(grid) {
+        var deferred = Ext.create('Deft.Deferred');
+        var store = Ext.create('Rally.data.wsapi.Store', {
+            fetch: grid.getStore().config.fetch,
+            filters: grid.getStore().config.filters,
+            model: grid.getStore().config.model,
+            limit: Infinity,
+            pageSize: Infinity
+
+        });
+
+        var columns = grid.columns;
+        var headers = this._getHeadersFromGrid(grid);
+        var column_names = this._getColumnNamesFromGrid(grid);
+
+        var record_count = grid.getStore().getTotalCount(),
+            page_size = grid.getStore().pageSize,
+            pages = Math.ceil(record_count / page_size),
+            promises = [];
+
+        for (var page = 1; page <= pages; page++) {
+            promises.push(this.loadStorePage(grid, store, columns, page, pages));
+        }
+        Deft.Promise.all(promises).then({
+            success: function(csvs) {
+                var csv = [];
+                csv.push('"' + headers.join('","') + '"');
+                _.each(csvs, function(c) {
+                    _.each(c, function(line) {
+                        csv.push(line);
+                    });
+                });
+                csv = csv.join('\r\n');
+                deferred.resolve(csv);
+                Rally.getApp().setLoading(false);
+            }
+        });
+        return deferred.promise;
+    },
+
+    // custom grid assumes there store is fully loaded
+    _getCSVFromCustomBackedGridWithPaging: function(grid) {
+        var deferred = Ext.create('Deft.Deferred');
+
+
+        var store = Ext.create('Rally.data.custom.Store', {
+            model: grid.getStore().config.model,
+            filters: grid.getStore().config.filters,
+            limit: Infinity,
+            pageSize: Infinity
+        });
+
+        var columns = grid.columns;
+        var headers = this._getHeadersFromGrid(grid);
+        var column_names = this._getColumnNamesFromGrid(grid);
+
+        var record_count = grid.getStore().getTotalCount(),
+            page_size = grid.getStore().pageSize,
+            pages = Math.ceil(record_count / page_size),
+            promises = [];
+
+        // for (var page = 1; page <= pages; page ++ ) {
+        //     promises.push(this.loadStorePage(grid, store, columns, page, pages));
+        // }
+
+        promises.push(this.loadStorePage(grid, store, columns, page, pages));
+
+        Deft.Promise.all(promises).then({
+            success: function(csvs) {
+                var csv = [];
+                csv.push('"' + headers.join('","') + '"');
+                _.each(csvs, function(c) {
+                    _.each(c, function(line) {
+                        csv.push(line);
+                    });
+                });
+                csv = csv.join('\r\n');
+                deferred.resolve(csv);
+                Rally.getApp().setLoading(false);
+            }
+        });
+        return deferred.promise;
+    },
+
+
+    // custom grid assumes there store is fully loaded
+    _getCSVFromCustomBackedGrid: function(grid) {
+        var deferred = Ext.create('Deft.Deferred');
+        var me = this;
+
+        Rally.getApp().setLoading("Assembling data for export...");
+
+        var headers = this._getHeadersFromGrid(grid);
+        var store = Ext.clone(grid.getStore());
+        var columns = grid.columns;
+        var column_names = this._getColumnNamesFromGrid(grid);
+
+        var record_count = grid.getStore().getTotalCount();
+        var original_page_size = grid.getStore().pageSize;
+
+        var page_size = 20000;
+        var number_of_pages = Math.ceil(record_count / page_size);
+        store.pageSize = page_size;
+
+        var pages = [],
+            promises = [];
+
+        for (var page = 1; page <= number_of_pages; page++) {
+            pages.push(page);
+        }
+
+        Ext.Array.each(pages, function(page) {
+            promises.push(function() {
+                return me._loadStorePage(grid, store, columns, page, pages.length)
+            });
+        });
+
+        Deft.Chain.sequence(promises).then({
+            success: function(csvs) {
+
+                // set page back to last view
+                store.pageSize = original_page_size;
+                store.loadPage(1);
+
+                var csv = [];
+                csv.push('"' + headers.join('","') + '"');
+                _.each(csvs, function(c) {
+                    _.each(c, function(line) {
+                        csv.push(line);
+                    });
+                });
+                csv = csv.join('\r\n');
+                deferred.resolve(csv);
+                Rally.getApp().setLoading(false);
+            }
+        });
+
+        return deferred.promise;
+    },
+
+
+
+    _loadStorePage: function(grid, store, columns, page, total_pages) {
+        var deferred = Ext.create('Deft.Deferred');
+
+        store.loadPage(page, {
+            callback: function(records) {
+                var csv = [];
+                for (var i = 0; i < records.length; i++) {
+                    // if(i==0){
+                    //     Rally.getApp().setLoading("Loading page "+page+ " of "+total_pages);
+                    // }
+                    var record = records[i];
+                    csv.push(this._getCSVFromRecord(record, grid, store));
+                }
+                deferred.resolve(csv);
+            },
+            scope: this
+        });
+        return deferred.promise;
+    },
+
+
+    _getHeadersFromGrid: function(grid) {
+        var headers = [];
+        var columns = grid.columns;
+
+        Ext.Array.each(columns, function(column) {
+            if (column.dataIndex || column.renderer) {
+                if (column.csvText) {
+                    headers.push(column.csvText.replace('&nbsp;', ' '));
+                }
+                else if (column.text) {
+                    headers.push(column.text.replace('&nbsp;', ' '));
+                }
+            }
+        });
+
+        return headers;
+    },
+
+    _getColumnNamesFromGrid: function(grid) {
+        var names = [];
+        var columns = grid.columns;
+
+        Ext.Array.each(columns, function(column) {
+            if (column.dataIndex || column.renderer) {
+                names.push(column.dataIndex);
+            }
+        });
+
+        return names;
+    },
+    /*
+     * will render using your grid renderer.  If you want it to ignore the grid renderer, 
+     * have the column set _csvIgnoreRender: true
+     */
+    getCSVFromGrid: function(app, grid) {
+        if (Ext.getClassName(grid.getStore()) != "Ext.data.TreeStore" &&
+            Ext.getClassName(grid.getStore()) != "Rally.data.custom.Store") {
+            return this._getCSVFromWsapiBackedGrid(grid);
+        }
+
+        return this._getCSVFromCustomBackedGrid(grid);
+    },
+
+    loadStorePage: function(grid, store, columns, page, total_pages) {
+        var deferred = Ext.create('Deft.Deferred');
+
+        store.loadPage(page, {
+            callback: function(records, operation, success) {
+                var csv = [];
+                Rally.getApp().setLoading(Ext.String.format('Page {0} of {1} loaded', page, total_pages));
+                for (var i = 0; i < records.length; i++) {
+                    var record = records[i];
+                    csv.push(this._getCSVFromRecord(record, grid, store));
+                }
+                deferred.resolve(csv);
+            },
+            scope: this
+        });
+        return deferred;
+    },
+
+    _getCSVFromRecord: function(record, grid, store) {
+        var mock_meta_data = {
+            align: "right",
+            classes: [],
+            cellIndex: 9,
+            column: null,
+            columnIndex: 9,
+            innerCls: undefined,
+            recordIndex: 5,
+            rowIndex: 5,
+            style: "",
+            tdAttr: "",
+            tdCls: "x-grid-cell x-grid-td x-grid-cell-headerId-gridcolumn-1029 x-grid-cell-last x-unselectable",
+            unselectableAttr: "unselectable='on'"
+        };
+
+        var node_values = [];
+        var columns = grid.columns;
+        Ext.Array.each(columns, function(column) {
+            if (column.xtype != 'rallyrowactioncolumn') {
+                if (column.dataIndex) {
+                    var column_name = column.dataIndex;
+
+                    var display_value = record.get(column_name);
+
+                    if (!column._csvIgnoreRender && column.renderer) {
+                        if (column.exportRenderer) {
+                            display_value = column.exportRenderer(display_value, mock_meta_data, record, 0, 0, store, grid.getView());
+                        }
+                        else {
+                            display_value = column.renderer(display_value, mock_meta_data, record, 0, 0, store, grid.getView());
+                        }
+                    }
+                    node_values.push(display_value);
+                }
+                else {
+                    var display_value = null;
+                    if (!column._csvIgnoreRender && column.renderer) {
+                        if (column.exportRenderer) {
+                            display_value = column.exportRenderer(display_value, mock_meta_data, record, record, 0, 0, store, grid.getView());
+                        }
+                        else {
+                            display_value = column.renderer(display_value, mock_meta_data, record, record, 0, 0, store, grid.getView());
+                        }
+                        node_values.push(display_value);
+                    }
+                }
+
+            }
+        }, this);
+        return '"' + node_values.join('","') + '"';
+    }
+
+});
+Ext.define('Constants', {
+    statics: {
+        CHART_TITLE: 'Committed vs. Delivered',
+        PLANNED: 'Planned',
+        UNPLANNED: 'Unplanned',
+        COMMITTED: 'Committed',
+        DELIVERED: 'Delivered',
+        IN_PROGRESS: ' (In-Progress)',
+        Y_AXIS_TITLE_COUNT: 'Count',
+        Y_AXIS_TITLE_POINT: 'Points',
+        APP_RESERVED_HEIGHT: 60,
+        ALWAYS_SELECTED_FIELDS: [
+            'FormattedID',
+            'Name'
+        ],
+        DERIVED_FIELDS: [
+            'timeboxName',
+            'timeboxStartDate',
+            'timeboxEndDate',
+            'timeboxAddedDate',
+            'Planned',
+            'Delivered'
+        ],
+        STORY_DEFAULT_FIELDS: [
+            'FormattedID',
+            'Name',
+            'ScheduleState',
+            'Iteration',
+            'Release',
+            'AcceptedDate',
+            'PlanEstimate'
+        ],
+        PI_DEFAULT_FIELDS: [
+            'FormattedID',
+            'Name',
+            'State',
+            'Release',
+            'ActualEndDate',
+        ],
+        TIMEBOX_TYPE_ITERATION: 'Iteration',
+        TIMEBOX_TYPE_RELEASE: 'Release',
+        TIMEBOX_TYPE_ITERATION_LABEL: 'Iteration',
+        TIMEBOX_TYPE_RELEASE_LABEL: 'Release',
+        UNPLANNED_DESCRIPTION: 'added to {timebox} more than {days} days after start'
+    }
+});
+
+Ext.override(Rally.app.App, {
+    /**
+     * OVERRIDE: PreferenceManager.update returns records, not an updated settings
+     * hash. This method in the SDK appears to simply apply the wrong data
+     * to this.settings
+     */
+
+    /**
+     * Update the settings for this app in preferences.
+     * Provide a settings hash and this will update existing prefs or create new prefs.
+     * @param options.settings the settings to create/update
+     * @param options.success called when the prefs are loaded
+     * @param options.scope scope to call success with
+     */
+    updateSettingsValues: function(options) {
+        Rally.data.PreferenceManager.update(Ext.apply(this._getAppSettingsLoadOptions(), {
+            requester: this,
+            settings: options.settings,
+            success: function(updatedSettings) {
+                var updatedSettingsHash = _.reduce(updatedSettings, function(accumulator, updatedSetting) {
+                    accumulator[updatedSetting.get('Name')] = updatedSetting.get('Value');
+                    return accumulator;
+                }, {});
+                Ext.apply(this.settings, updatedSettingsHash);
+
+                if (options.success) {
+                    options.success.call(options.scope);
+                }
+            },
+            scope: this
+        }));
+    }
+})
+
+/* global Ext Rally Constants Utils */
+Ext.define("committed-vs-delivered", {
+    extend: 'Rally.app.App',
+    componentCls: 'app',
+    layout: {
+        type: 'vbox',
+        align: 'stretch'
+    },
+    items: [{
+            id: Utils.AncestorPiAppFilter.RENDER_AREA_ID,
+            xtype: 'container',
+            layout: {
+                type: 'hbox',
+                align: 'middle',
+                defaultMargins: '0 10 10 0',
+            }
+        },
+        {
+            xtype: 'container',
+            itemId: 'controls-area',
+            layout: 'hbox'
+        },
+        {
+            xtype: 'container',
+            itemId: 'filters-area',
+        },
+        {
+            id: 'grid-area',
+            xtype: 'container',
+            flex: 1,
+            type: 'vbox',
+            align: 'stretch'
+        }
+    ],
+    config: {
+        defaultSettings: {
+            artifactType: 'HierarchicalRequirement',
+            timeboxType: Constants.TIMEBOX_TYPE_RELEASE,
+            timeboxCount: 5,
+            planningWindow: 2,
+            currentTimebox: true,
+            showPoints: true
+        }
+    },
+
+    integrationHeaders: {
+        name: "committed-vs-delivered"
+    },
+
+    currentData: [],
+    settingsChanged: false,
+
+    launch: function() {
+        Rally.data.util.PortfolioItemHelper.getPortfolioItemTypes().then({
+            scope: this,
+            success: function(portfolioItemTypes) {
+                this.portfolioItemTypes = _.sortBy(portfolioItemTypes, function(type) {
+                    return type.get('Ordinal');
+                });
+                this.lowestPiType = this.portfolioItemTypes[0];
+                this.setModelFieldsForType(this.getSetting('artifactType'));
+                this.setTimeboxFieldsForType(this.getSetting('timeboxType'));
+                this.viewChange();
+            },
+            failure: function(msg) {
+                this._showError(msg);
+            },
+        })
+    },
+
+    setModelFieldsForType: function(artifactType) {
+        this.modelName = artifactType;
+        this.acceptedDateField = 'AcceptedDate';
+        if (this.isPiTypeSelected()) {
+            this.acceptedDateField = 'ActualEndDate'
+        }
+    },
+
+    setTimeboxFieldsForType: function(timeboxType) {
+        this.timeboxType = timeboxType;
+
+        if (this.timeboxType == Constants.TIMEBOX_TYPE_RELEASE) {
+            this.timeboxStartDateField = 'ReleaseStartDate';
+            this.timeboxEndDateField = 'ReleaseDate';
+        }
+        else if (this.timeboxType == Constants.TIMEBOX_TYPE_ITERATION) {
+            this.timeboxStartDateField = 'StartDate';
+            this.timeboxEndDateField = 'EndDate'
+        }
+    },
+
+    /**
+     * Return a promise that resolves once the controls are initialized and
+     * have initial values
+     */
+    addControls: function() {
+        var filterDeferred = Ext.create('Deft.Deferred');
+        var context = this.getContext();
+        var controlsArea = this.down('#controls-area');
+        controlsArea.removeAll();
+        controlsArea.add([{
+            xtype: 'rallyinlinefilterbutton',
+            modelNames: [this.modelName],
+            context: context,
+            stateful: true,
+            stateId: context.getScopedStateId(this.modelName + 'filters'), // filters specific to type of object
+            inlineFilterPanelConfig: {
+                quickFilterPanelConfig: {
+                    // Supply a list of Portfolio Item Types. For example `Rally.data.util.PortfolioItemHelper.getPortfolioItemTypes()`
+                    portfolioItemTypes: this.portfolioItemTypes,
+                    // Set the TypePath of the model item that is being filtered. For example: 'PortfolioItem/Feature' or 'Defect'
+                    modelName: this.modelName
+                }
+            },
+            listeners: {
+                scope: this,
+                inlinefilterready: function(panel) {
+                    this.down('#filters-area').add(panel);
+                },
+
+                inlinefilterchange: function(cmp) {
+                    if (filterDeferred.getState() == 'pending') {
+                        // This is the first filter change event.
+                        // This component fires change before it is fully added. Capture the
+                        // reference to the filter button in the change handler so it can be used
+                        // by loadPrimaryStories. Attempts to get to
+                        // the button by using this.down('rallyinlinefilte/rbutton') will return null
+                        // at this point.
+                        this.filterButton = cmp;
+                        filterDeferred.resolve();
+                    }
+                    else {
+                        this.viewChange();
+                    }
+                },
+            }
+        }, {
+            xtype: 'container',
+            flex: 1
+        }, {
+            xtype: 'tsfieldpickerbutton',
+            margin: '0 10 0 0',
+            toolTipConfig: {
+                html: 'Columns to Export',
+                anchor: 'top'
+            },
+            getTitle: function() {
+                return 'Export Columns';
+            },
+            modelNames: [this.modelName],
+            _fields: this.isPiTypeSelected() ? Constants.PI_DEFAULT_FIELDS : Constants.STORY_DEFAULT_FIELDS,
+            context: context,
+            stateful: true,
+            stateId: context.getScopedStateId(this.modelName + 'fields'), // columns specific to type of object
+            // Always need the accepted date field
+            alwaysSelectedValues: Constants.ALWAYS_SELECTED_FIELDS.concat(this.acceptedDateField),
+            listeners: {
+                fieldsupdated: function(fields) {
+                    this.viewChange();
+                },
+                scope: this
+            }
+        }, {
+            xtype: 'rallybutton',
+            style: { 'float': 'right' },
+            cls: 'secondary rly-small',
+            frame: false,
+            itemId: 'actions-menu-button',
+            iconCls: 'icon-export',
+            listeners: {
+                click: function(button) {
+                    var menu = Ext.widget({
+                        xtype: 'rallymenu',
+                        items: [{
+                            text: 'Export to CSV...',
+                            handler: function() {
+                                var csvText = CArABU.technicalservices.FileUtilities.convertDataArrayToCSVText(this.currentData, this.getExportFieldsHash());
+                                CArABU.technicalservices.FileUtilities.saveCSVToFile(csvText, 'committed.csv');
+                            },
+                            scope: this
+                        }]
+                    });
+                    menu.showBy(button.getEl());
+                    if (button.toolTip) {
+                        button.toolTip.hide();
+                    }
+                },
+                scope: this
+            }
+        }]);
+
+        return filterDeferred.promise;
+    },
+
+    getFieldsFromButton: function() {
+        var fieldPicker = this.down('tsfieldpickerbutton');
+        var result = [];
+        if (fieldPicker) {
+            result = fieldPicker.getFields();
+        }
+        return result;
+    },
+
+    getExportFieldsHash: function() {
+        var fields = this.getFieldsFromButton();
+        // Special case, add the accepted date after all fields from the field picker so it
+        // is next to the derirved fields instead of in the first column of export.
+        // Use _.unique to remove duplicate as that field is also always selected.
+        fields = _.without(fields, this.acceptedDateField);
+        fields.push(this.acceptedDateField);
+        fields = fields.concat(Constants.DERIVED_FIELDS);
+        return _.reduce(fields, function(accum, field) {
+            accum[field] = this.headerName(field);
+            return accum;
+        }, {}, this);
+    },
+
+    headerName: function(field) {
+        var result;
+        switch (field) {
+            case "Iteration":
+                result = 'Currently linked to Iteration'
+                break;
+            case "Release":
+                result = 'Currently linked to Release'
+                break;
+            case 'timeboxName':
+                result = this.timeboxType;
+                break;
+            case 'timeboxStartDate':
+                result = this.timeboxType + ' Start Date';
+                break;
+            case 'timeboxEndDate':
+                result = this.timeboxType + ' End Date';
+                break;
+            case 'timeboxAddedDate':
+                result = 'Linked to ' + this.timeboxType + ' on';
+                break;
+            default:
+                result = field;
+        }
+
+        return result;
+    },
+
+    getFiltersFromButton: function() {
+        var filters = null;
+        try {
+            filters = this.filterButton.getWsapiFilter()
+        }
+        catch (ex) {
+            // Ignore if filter button not yet available
+        }
+
+        return filters;
+    },
+
+    // Usual monkey business to size gridboards
+    onResize: function() {
+        this.callParent(arguments);
+        var gridArea = this.down('#grid-area');
+        var gridboard = this.down('rallygridboard');
+        if (gridArea && gridboard) {
+            gridboard.setHeight(gridArea.getHeight() - Constants.APP_RESERVED_HEIGHT)
+        }
+    },
+
+    _buildChartConfig: function() {
+        // Get the last N timeboxes
+        return this.getTimeboxes().then({
+            scope: this,
+            success: function(timeboxGroups) {
+                var promises = _.map(timeboxGroups, function(timeboxGroup) {
+                    var timebox = timeboxGroup[0]; // Representative timebox for the group
+                    var planningWindowEndIso = Ext.Date.add(timebox.get(this.timeboxStartDateField), Ext.Date.DAY, this.getSetting('planningWindow')).toISOString();
+                    var timeboxEndIso = timebox.get(this.timeboxEndDateField).toISOString();
+                    var timeboxStartIso = timebox.get(this.timeboxStartDateField).toISOString();
+                    var snapshotByOid = {}
+                    return this.getSnapshotsFromTimeboxGroup(timeboxGroup).then({
+                        scope: this,
+                        success: function(snapshots) {
+                            if (!snapshots || snapshots.length == 0) {
+                                return {
+                                    timebox: timebox,
+                                    artifactStore: null
+                                }
+                            }
+                            else {
+                                var oidQueries = [];
+                                _.each(snapshots, function(snapshot) {
+                                    var oid = snapshot.get('ObjectID');
+                                    oidQueries.push({
+                                        property: 'ObjectID',
+                                        value: oid
+                                    });
+                                    snapshotByOid[oid] = snapshot;
+                                }, this);
+
+                                // We can't get other data like accepted date
+                                // as part of the planned/unplanned lookback query because then we'd have
+                                // to compress potentially many snapshots on the client side.
+                                var filters = Rally.data.wsapi.Filter.or(oidQueries);
+
+                                var advancedFilters = this.getFiltersFromButton();
+                                if (advancedFilters) {
+                                    filters = filters.and(advancedFilters);
+                                    this.advancedFiltersString = advancedFilters.toString();
+                                }
+                                else {
+                                    this.advancedFiltersString = '';
+                                }
+
+                                var artifactStore = Ext.create('Rally.data.wsapi.Store', {
+                                    model: this.modelName,
+                                    fetch: this.getFieldsFromButton(),
+                                    autoLoad: false,
+                                    enablePostGet: true,
+                                    filters: filters,
+                                    pageSize: 2000,
+                                    limit: Infinity
+                                });
+                                return artifactStore.load().then({
+                                    scope: this,
+                                    success: function(artifacts) {
+                                        // Augment each artifact with Planned, Delivered and timebox Added Date
+                                        _.each(artifacts, function(artifact) {
+                                            var snapshot = snapshotByOid[artifact.get('ObjectID')];
+                                            var validFrom = snapshot.get('_ValidFrom')
+                                            if (validFrom <= planningWindowEndIso) {
+                                                artifact.set('Planned', true);
+                                            }
+                                            var acceptedDate = artifact.get(this.acceptedDateField);
+                                            if (acceptedDate) {
+                                                var acceptedIso = acceptedDate.toISOString();
+                                                if (acceptedIso <= timeboxEndIso) {
+                                                    artifact.set('Delivered', true);
+                                                }
+                                                // Special case where artifact may be assigned to timeboxes that occur after
+                                                // its accepted date. We may want to render these differently so they don't
+                                                // show up as 'Delivered' in multiple timeboxes.
+                                                if (acceptedIso < timeboxStartIso) {
+                                                    artifact.set('AcceptedBeforeTimeboxStart', true);
+                                                }
+                                            }
+                                            artifact.set('timeboxAddedDate', new Date(validFrom));
+                                            artifact.set('timeboxName', timebox.get('Name'));
+                                            artifact.set('timeboxStartDate', timebox.get(this.timeboxStartDateField));
+                                            artifact.set('timeboxEndDate', timebox.get(this.timeboxEndDateField))
+                                        }, this);
+                                        return {
+                                            timebox: timebox,
+                                            artifactStore: artifactStore
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    })
+                }, this);
+                return Deft.Promise.all(promises)
+            }
+        }).then({
+            scope: this,
+            success: function(data) {
+                this.data = data;
+                return this.getChartConfig(this.data);
+            }
+        });
+    },
+
+    getChartConfig: function(data) {
+        var sortedData = _.sortBy(data, function(datum) {
+            return datum.timebox.get(this.timeboxStartDateField).toISOString();
+        }, this);
+        var timeboxNames = [];
+        var plannedCommitted = [];
+        var plannedDelivered = [];
+        var unplannedCommitted = [];
+        var unplannedDelivered = [];
+        this.currentData = [];
+        _.each(sortedData, function(datum, index, collection) {
+            var pc = 0,
+                pd = 0,
+                uc = 0,
+                ud = 0;
+
+            var timeboxName = datum.timebox.get('Name');
+            // If this is the current in-progress timebox, annotate its name
+            if (this.getSetting('currentTimebox') && index == collection.length - 1) {
+                if (datum.timebox.get(this.timeboxEndDateField) >= new Date()) {
+                    timeboxName = timeboxName + Constants.IN_PROGRESS;
+                }
+            }
+            timeboxNames.push(timeboxName);
+
+            if (datum.artifactStore) {
+                datum.artifactStore.each(function(artifact) {
+                    if (artifact.get('AcceptedBeforeTimeboxStart')) {
+                        // Special case. The artifact was accepted before the timebox started. The work occurred
+                        // *before* this timebox started and is NOT therefore included in the timebox as committed
+                        // or delivered.
+                    }
+                    else {
+                        this.currentData.push(artifact.data);
+                        if (artifact.get('Planned')) {
+                            pc += this.getSetting('showPoints')? artifact.get('PlanEstimate'):1; // Committed and planned
+                            if (artifact.get('Delivered')) {
+                                pd += this.getSetting('showPoints')? artifact.get('PlanEstimate'):1;
+                            }
+                        }
+                        else {
+                            uc += this.getSetting('showPoints')? artifact.get('PlanEstimate'):1;
+                            if (artifact.get('Delivered')) {
+                                ud += this.getSetting('showPoints')? artifact.get('PlanEstimate'):1;
+                            }
+                        }
+                    }
+                }, this);
+            }
+            plannedCommitted.push(pc);
+            plannedDelivered.push(pd);
+            unplannedCommitted.push(uc);
+            unplannedDelivered.push(ud);
+        }, this);
+
+        var title = this.getSetting('showPoints')?"Story Points":"Stories";
+        var yAxisTitle = this.getSetting('showPoints')?Constants.Y_AXIS_TITLE_POINT:Constants.Y_AXIS_TITLE_COUNT;
+
+        if (this.isPiTypeSelected()) {
+            title = this.lowestPiType.get('Name') + 's';
+        }
+        return {
+            xtype: 'rallychart',
+            loadMask: false,
+            chartColors: [
+                "#FAD200", // $yellow
+                "#8DC63F", // $lime
+            ],
+            chartConfig: {
+                chart: {
+                    type: 'column',
+                    animation: false
+                },
+                title: {
+                    text: title + ' ' + Constants.CHART_TITLE + ' by ' + this.timeboxType
+                },
+                legend: {
+                    layout: 'vertical',
+                    labelFormatter: function() {
+                        var result = this.name;
+                        if (this.name == Constants.UNPLANNED) {
+                            var app = Rally.getApp();
+                            var timeboxType = app.getSetting('timeboxType');
+                            var days = app.getSetting('planningWindow');
+                            result = this.name + ' (' + Constants.UNPLANNED_DESCRIPTION.replace('{timebox}', timeboxType).replace('{days}', days) + ')'
+                        }
+                        return result;
+                    }
+                },
+                plotOptions: {
+                    column: {
+                        stacking: 'normal'
+                    },
+                    series: {
+                        animation: false,
+                        dataLabels: {
+                            align: 'center',
+                            verticalAlign: 'top',
+                        },
+                        events: {
+                            legendItemClick: function() { return false; } // Disable hiding some of data on legend click
+                        }
+                    }
+                },
+                yAxis: {
+                    allowDecimals: false,
+                    title: {
+                        text: yAxisTitle
+                    }
+                }
+            },
+            chartData: {
+                categories: timeboxNames,
+                series: [{
+                    dataLabels: {
+                        enabled: true,
+                        format: '{total} ' + Constants.COMMITTED,
+                        inside: false,
+                        y: -20,
+                        overflow: 'justify'
+                    },
+                    data: unplannedCommitted,
+                    stack: 0,
+                    legendIndex: 2,
+                    name: Constants.UNPLANNED
+                }, {
+                    data: plannedCommitted,
+                    stack: 0,
+                    legendIndex: 1,
+                    name: Constants.PLANNED
+                }, {
+                    dataLabels: {
+                        enabled: true,
+                        format: '{total} ' + Constants.DELIVERED,
+                        inside: false,
+                        y: -20,
+                        overflow: 'justify'
+                    },
+                    data: unplannedDelivered,
+                    stack: 1,
+                    showInLegend: false,
+                    name: Constants.UNPLANNED
+                }, {
+                    data: plannedDelivered,
+                    stack: 1,
+                    showInLegend: false,
+                    name: Constants.PLANNED
+                }]
+            }
+        }
+    },
+
+    getTimeboxes: function() {
+        // Get the N most recent timeboxes in the current project
+        // Sort by name
+        // Get timeboxes by name from all child projects
+
+        var timeboxFilterProperty = this.timeboxEndDateField;
+        if (this.getSetting('currentTimebox')) {
+            timeboxFilterProperty = this.timeboxStartDateField;
+        }
+        return Ext.create('Rally.data.wsapi.Store', {
+            model: this.timeboxType,
+            autoLoad: false,
+            context: {
+                projectScopeDown: false,
+                projectScopeUp: false
+            },
+            sorters: [{
+                property: timeboxFilterProperty,
+                direction: 'DESC'
+            }],
+            filters: [{
+                property: timeboxFilterProperty,
+                operator: '<=',
+                value: 'today'
+            }],
+            pageSize: this.getSetting('timeboxCount')
+        }).load().then({
+            scope: this,
+            success: function(timeboxes) {
+                var timeboxFilter = _.map(timeboxes, function(timebox) {
+                    return Rally.data.wsapi.Filter.and([{
+                        property: 'Name',
+                        value: timebox.get('Name')
+                    }, {
+                        property: this.timeboxStartDateField,
+                        value: timebox.get(this.timeboxStartDateField)
+                    }, {
+                        property: this.timeboxEndDateField,
+                        value: timebox.get(this.timeboxEndDateField)
+                    }]);
+                }, this);
+                if (timeboxFilter.length) {
+                    return Rally.data.wsapi.Filter.or(timeboxFilter)
+                }
+                else {
+                    return null;
+                }
+            }
+        }).then({
+            scope: this,
+            success: function(timeboxFilter) {
+                if (timeboxFilter) {
+                    return Ext.create('Rally.data.wsapi.Store', {
+                        model: this.timeboxType,
+                        autoLoad: false,
+                        fetch: ['ObjectID', this.timeboxStartDateField, this.timeboxEndDateField, 'Name'],
+                        enablePostGet: true,
+                        sorters: [{
+                            property: this.timeboxEndDateField,
+                            direction: 'DESC'
+                        }],
+                        filters: [timeboxFilter]
+                    }).load()
+                }
+                else {
+                    return [];
+                }
+            }
+        }).then({
+            scope: this,
+            success: function(timeboxes) {
+                // Group by timebox name
+                return _.groupBy(timeboxes, function(timebox) {
+                    return timebox.get('Name');
+                });
+            }
+        })
+    },
+
+    getSnapshotsFromTimeboxGroup: function(timeboxGroup) {
+        var timebox = timeboxGroup[0]; // Representative timebox for the group
+        var timeboxOids = _.map(timeboxGroup, function(timebox) {
+            return timebox.get('ObjectID');
+        });
+        var timeboxEndIso = timebox.get(this.timeboxEndDateField).toISOString();
+        var planningWindowEndIso = Ext.Date.add(timebox.get(this.timeboxStartDateField), Ext.Date.DAY, this.getSetting('planningWindow')).toISOString();
+        var dateFilter = Rally.data.lookback.QueryFilter.and([{
+                property: '_ValidFrom',
+                operator: '<=',
+                value: timeboxEndIso
+            },
+            {
+                property: '_ValidTo',
+                operator: '>=',
+                value: planningWindowEndIso
+            }
+        ]);
+        var dataContext = this.getContext().getDataContext();
+
+        var filters = [{
+                property: '_TypeHierarchy',
+                value: this.modelName
+            },
+            {
+                property: this.timeboxType,
+                operator: 'in',
+                value: timeboxOids
+            },
+            {
+                property: '_ProjectHierarchy',
+                value: Rally.util.Ref.getOidFromRef(dataContext.project)
+            },
+            dateFilter
+        ];
+
+        var store = Ext.create('Rally.data.lookback.SnapshotStore', {
+            autoLoad: false,
+            context: dataContext,
+            fetch: [this.timeboxType, '_ValidFrom', '_ValidTo', 'ObjectID'],
+            hydrate: [this.timeboxType],
+            remoteSort: false,
+            compress: true,
+            enablePostGet: true, // TODO (tj) verify POST is used
+            filters: filters,
+        });
+        return store.load();
+    },
+
+    _addGridboard: function(chartConfig) {
+        var gridArea = this.down('#grid-area')
+        gridArea.removeAll();
+
+        var filters = [];
+
+        var context = this.getContext();
+        this.gridboard = gridArea.add({
+            xtype: 'rallygridboard',
+            context: context,
+            modelNames: [this.modelName],
+            toggleState: 'chart',
+            height: gridArea.getHeight() - Constants.APP_RESERVED_HEIGHT,
+            chartConfig: chartConfig,
+            listeners: {
+                scope: this,
+                viewchange: this.viewChange,
+            }
+        });
+    },
+
+    isPiTypeSelected: function() {
+        return this.modelName == this.lowestPiType.get('TypePath');
+    },
+
+    getConfigItems: function() {
+        var timeboxTypeStore = Ext.create('Ext.data.Store', {
+            fields: ['name', 'value'],
+            data: [
+                { name: Constants.TIMEBOX_TYPE_ITERATION_LABEL, value: Constants.TIMEBOX_TYPE_ITERATION },
+                { name: Constants.TIMEBOX_TYPE_RELEASE_LABEL, value: Constants.TIMEBOX_TYPE_RELEASE },
+            ]
+        });
+        var typeStoreData = [
+            { name: 'User Story', value: 'HierarchicalRequirement' },
+            { name: 'Defect', value: 'Defect' },
+        ];
+        // Called from getSettingsFields which is invoked before launch sets up the lowestPiType. Handle
+        // this case.
+        if (this.lowestPiType) {
+            typeStoreData.push({ name: this.lowestPiType.get('Name'), value: this.lowestPiType.get('TypePath') })
+        }
+        var artifactTypeStore = Ext.create('Ext.data.Store', {
+            fields: ['name', 'value'],
+            data: typeStoreData
+        });
+        return [{
+                xtype: 'combobox',
+                name: 'artifactType',
+                value: this.getSetting('artifactType'),
+                fieldLabel: 'Artifact type',
+                labelWidth: 150,
+                store: artifactTypeStore,
+                queryMode: 'local',
+                displayField: 'name',
+                valueField: 'value',
+                listeners: {
+                    scope: this,
+                    change: function(field, newValue, oldValue) {
+                        if (newValue != oldValue) {
+                            this.updateSettingsValues({
+                                settings: {
+                                    artifactType: newValue
+                                }
+                            });
+                            // Choice of artifact has changed
+                            this.setModelFieldsForType(newValue);
+                            // If Feature, also update timebox type to 'Release'
+                            var timeboxTypeControl = Ext.ComponentManager.get('timeboxType');
+                            if (this.isPiTypeSelected()) {
+                                timeboxTypeControl.setValue(Constants.TIMEBOX_TYPE_RELEASE);
+                                timeboxTypeControl.disable(); // User cannot pick other timeboxes for Features
+                            }
+                            else {
+                                timeboxTypeControl.enable();
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                xtype: 'combobox',
+                name: 'timeboxType',
+                id: 'timeboxType',
+                value: this.getSetting('timeboxType'),
+                fieldLabel: 'Timebox type',
+                labelWidth: 150,
+                store: timeboxTypeStore,
+                queryMode: 'local',
+                displayField: 'name',
+                valueField: 'value',
+                disabled: this.isPiTypeSelected(),
+                listeners: {
+                    scope: this,
+                    change: function(field, newValue, oldValue) {
+                        if (newValue != oldValue) {
+                            this.updateSettingsValues({
+                                settings: {
+                                    timeboxType: newValue
+                                }
+                            });
+                            // Choice of timebox has changed
+                            this.setTimeboxFieldsForType(newValue);
+                        }
+                    }
+                }
+            },
+            {
+                xtype: 'rallynumberfield',
+                name: 'timeboxCount',
+                value: this.getSetting('timeboxCount'),
+                fieldLabel: "Timebox Count",
+                labelWidth: 150,
+                minValue: 1,
+                allowDecimals: false,
+                listeners: {
+                    scope: this,
+                    change: function(field, newValue, oldValue) {
+                        if (newValue != oldValue) {
+                            this.updateSettingsValues({
+                                settings: {
+                                    timeboxCount: newValue
+                                }
+                            });
+                        }
+                    }
+                }
+            }, {
+                xtype: 'rallynumberfield',
+                name: 'planningWindow',
+                value: this.getSetting('planningWindow'),
+                fieldLabel: 'Timebox planning window (days)',
+                labelWidth: 150,
+                minValue: 0,
+                allowDecimals: false,
+                listeners: {
+                    scope: this,
+                    change: function(field, newValue, oldValue) {
+                        if (newValue != oldValue) {
+                            this.updateSettingsValues({
+                                settings: {
+                                    planningWindow: newValue
+                                }
+                            });
+                        }
+                    }
+                }
+            }, {
+                xtype: 'rallycheckboxfield',
+                name: 'currentTimebox',
+                value: this.getSetting('currentTimebox'),
+                fieldLabel: 'Show current, in-progress timebox',
+                labelWidth: 150,
+                listeners: {
+                    scope: this,
+                    change: function(field, newValue, oldValue) {
+                        if (newValue != oldValue) {
+                            this.updateSettingsValues({
+                                settings: {
+                                    currentTimebox: newValue
+                                }
+                            });
+                        }
+                    }
+                }
+            }, {
+                xtype: 'rallycheckboxfield',
+                name: 'showPoints',
+                value: this.getSetting('showPoints'),
+                fieldLabel: 'Use Story Points',
+                labelWidth: 150,
+                listeners: {
+                    scope: this,
+                    change: function(field, newValue, oldValue) {
+                        if (newValue != oldValue) {
+                            this.updateSettingsValues({
+                                settings: {
+                                    showPoints: newValue
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        ]
+    },
+
+    viewChange: function() {
+        this.setLoading(true);
+        // Add the other filter, config and export controls
+        this.addControls().then({
+            scope: this,
+            success: this._buildChartConfig
+        }).then({
+            scope: this,
+            success: function(chartConfig) {
+                this._addGridboard(chartConfig);
+                this.setLoading(false);
+            }
+        });
+    },
+
+    onSettingsClose: function() {
+        // Don't redraw the app unless something has changed
+        if (this.settingsChanged) {
+            this.settingsChanged = false;
+            this.viewChange();
+        }
+    },
+
+    updateSettingsValues: function(options) {
+        this.settingsChanged = true;
+        this.callParent(arguments);
+    },
+
+    getModelScopedStateId: function(modelName, id) {
+        return this.getContext().getScopedStateId(modelName + '-' + id);
+    },
+
+    getSettingsFields: function() {
+        return this.getConfigItems();
+    }
+});
+
+
+               Rally.launchApp('committed-vs-delivered', {
+                   name: 'committed-vs-delivered'
+               });
+        });
+    </script>
+
+    <style type="text/css">
+
+.app {}
+
+.settings-popover {
+    background-color: #FFF;
+}
+
+    </style>
+
+</head>
+<body></body>
+</html>

@@ -50,11 +50,6 @@ Ext.define("committed-vs-delivered", {
     currentData: [],
     settingsChanged: false,
 
-    onTimeboxScopeChange: function(scope) {
-        this.callParent(arguments);
-        this.viewChange();
-    },
-
     launch: function() {
         Rally.data.util.PortfolioItemHelper.getPortfolioItemTypes().then({
             scope: this,
@@ -658,10 +653,6 @@ Ext.define("committed-vs-delivered", {
         gridArea.removeAll();
 
         var filters = [];
-        var timeboxScope = this.getContext().getTimeboxScope();
-        if (timeboxScope && timeboxScope.isApplicable(this.modelName)) {
-            filters.push(timeboxScope.getQueryFilter());
-        }
 
         var context = this.getContext();
         this.gridboard = gridArea.add({
