@@ -29,7 +29,7 @@ Ext.define("committed-vs-delivered", {
             xtype: 'container',
             flex: 1,
             type: 'vbox',
-            align: 'stretch'
+//            align: 'stretch'
         }
     ],
     config: {
@@ -421,6 +421,16 @@ Ext.define("committed-vs-delivered", {
             plannedDelivered.push(pd);
             unplannedCommitted.push(uc);
             unplannedDelivered.push(ud);
+
+            //For the details table:
+            this.details = this.details || [];
+            this.details.push( {
+                release: timeboxName,
+                plannedCommitted: pc,
+                plannedDelivered: pd,
+                unplannedCommitted: uc,
+                unplannedDelivered: ud
+            });
         }, this);
 
         var title = this.getSetting('showPoints')?"Story Points":"Stories";
@@ -666,6 +676,66 @@ Ext.define("committed-vs-delivered", {
                 scope: this,
                 viewchange: this.viewChange,
             }
+        });
+
+/*
+            this.details.push( {
+                release: timeboxName,
+                plannedCommitted: pc,
+                plannedDelivered: pd,
+                unplannedCommitted: uc,
+                unplannedDelivered: ud
+            });
+
+*/
+
+        Ext.define('detailsModel', {
+            extend: 'Ext.data.Model',
+            fields: [
+                { name: 'release', type: 'string' },
+                { name: 'plannedCommitted', type: 'int'},
+                { name: 'plannedDelivered', type: 'int'},
+                { name: 'unplannedCommitted', type: 'int'},
+                { name: 'unplannedDelivered', type: 'int'},
+            ]
+        });
+
+
+        var detailsStore = Ext.create('Ext.data.Store', {
+            model: detailsModel,
+            data: this.details
+        });
+console.log(detailsStore);
+        this.add({
+            xtype: 'container',
+            layout: 'hbox',
+            items: [
+                {
+                    xtype: 'container',
+                    flex: 1
+                },
+                {
+                    xtype: 'container',
+                    id: 'middlebox',
+                    width: 800
+                },
+                {
+                    xtype: 'container',
+                    flex: 1
+                }
+            ]
+        });
+        this.down('#middlebox').add( {
+            xtype: 'gridpanel',
+            margin: '10 0 50 0',
+            store: detailsStore,
+            columns: [
+                { text: 'Release', dataIndex: 'release', flex: 1 },
+                { text: 'Planned Committed', dataIndex: 'plannedCommitted', width: 150 },
+                { text: 'Planned Delivered', dataIndex: 'plannedDelivered', width: 150 },
+                { text: 'Unplanned Committed', dataIndex: 'unplannedCommitted', width: 150 }, 
+                { text: 'Unplanned Delivered', dataIndex: 'unplannedDelivered', width: 150 }
+            ]
         });
     },
 
