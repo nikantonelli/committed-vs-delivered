@@ -1,4 +1,4 @@
-/* global Ext Rally Constants Utils */
+ /* global Ext Rally Constants Utils */
 Ext.define("committed-vs-delivered", {
     extend: 'Rally.app.App',
     componentCls: 'app',
@@ -35,9 +35,10 @@ Ext.define("committed-vs-delivered", {
     config: {
         defaultSettings: {
             artifactType: 'HierarchicalRequirement',
-            timeboxType: Constants.TIMEBOX_TYPE_RELEASE,
+            timeboxType: Constants.TIMEBOX_TYPE_ITERATION,
             timeboxCount: 5,
             planningWindow: 2,
+            acceptWindow: 1,
             currentTimebox: true,
             showPoints: true
         }
@@ -273,6 +274,7 @@ Ext.define("committed-vs-delivered", {
                 var promises = _.map(timeboxGroups, function(timeboxGroup) {
                     var timebox = timeboxGroup[0]; // Representative timebox for the group
                     var planningWindowEndIso = Ext.Date.add(timebox.get(this.timeboxStartDateField), Ext.Date.DAY, this.getSetting('planningWindow')).toISOString();
+                    var acceptWindowEndIso = Ext.Date.add(timebox.get(this.timeboxEndDateField), Ext.Date.DAY, this.getSetting('acceptWindow')).toISOString();
                     var timeboxEndIso = timebox.get(this.timeboxEndDateField).toISOString();
                     var timeboxStartIso = timebox.get(this.timeboxStartDateField).toISOString();
                     var snapshotByOid = {}
@@ -332,14 +334,14 @@ Ext.define("committed-vs-delivered", {
                                             var acceptedDate = artifact.get(this.acceptedDateField);
                                             if (acceptedDate) {
                                                 var acceptedIso = acceptedDate.toISOString();
-                                                if (acceptedIso <= timeboxEndIso) {
+                                                if (acceptedIso <= acceptWindowEndIso) {
                                                     artifact.set('Delivered', true);
                                                 }
                                                 // Special case where artifact may be assigned to timeboxes that occur after
                                                 // its accepted date. We may want to render these differently so they don't
                                                 // show up as 'Delivered' in multiple timeboxes.
-                                                if (acceptedIso < timeboxStartIso) {
-                                                    artifact.set('AcceptedBeforeTimeboxStart', true);
+                                                if ((acceptedIso < timeboxStartIso) || (acceptedIso > acceptWindowEndIso)){
+                                                     artifact.set('AcceptException', true);                                                
                                                 }
                                             }
                                             artifact.set('timeboxAddedDate', new Date(validFrom));
@@ -377,12 +379,15 @@ Ext.define("committed-vs-delivered", {
         var plannedDelivered = [];
         var unplannedCommitted = [];
         var unplannedDelivered = [];
+        var acceptException = [];
         this.currentData = [];
+        this.details = [];
         _.each(sortedData, function(datum, index, collection) {
             var pc = 0,
                 pd = 0,
                 uc = 0,
-                ud = 0;
+                ud = 0,
+                ae = 0;
 
             var timeboxName = datum.timebox.get('Name');
             // If this is the current in-progress timebox, annotate its name
@@ -395,10 +400,11 @@ Ext.define("committed-vs-delivered", {
 
             if (datum.artifactStore) {
                 datum.artifactStore.each(function(artifact) {
-                    if (artifact.get('AcceptedBeforeTimeboxStart')) {
+                    if (artifact.get('AcceptException')) {
                         // Special case. The artifact was accepted before the timebox started. The work occurred
                         // *before* this timebox started and is NOT therefore included in the timebox as committed
                         // or delivered.
+                        ae += this.getSetting('showPoints')?artifact.get('PlanEstimate'):1;
                     }
                     else {
                         this.currentData.push(artifact.data);
@@ -421,15 +427,16 @@ Ext.define("committed-vs-delivered", {
             plannedDelivered.push(pd);
             unplannedCommitted.push(uc);
             unplannedDelivered.push(ud);
+            acceptException.push(ae);
 
             //For the details table:
             this.details = this.details || [];
             this.details.push( {
-                release: timeboxName,
+                timeboxName: timeboxName,
                 plannedCommitted: pc,
                 plannedDelivered: pd,
                 unplannedCommitted: uc,
-                unplannedDelivered: ud
+                unplannedDelivered: ud,
             });
         }, this);
 
@@ -444,7 +451,7 @@ Ext.define("committed-vs-delivered", {
             loadMask: false,
             chartColors: [
                 "#FAD200", // $yellow
-                "#8DC63F", // $lime
+                "#8DC63F", // $lime,
             ],
             chartConfig: {
                 chart: {
@@ -654,6 +661,7 @@ Ext.define("committed-vs-delivered", {
             compress: true,
             enablePostGet: true, // TODO (tj) verify POST is used
             filters: filters,
+            removeUnauthorizedSnapshots: true
         });
         return store.load();
     },
@@ -692,7 +700,7 @@ Ext.define("committed-vs-delivered", {
         Ext.define('detailsModel', {
             extend: 'Ext.data.Model',
             fields: [
-                { name: 'release', type: 'string' },
+                { name: 'timeboxName', type: 'string' },
                 { name: 'plannedCommitted', type: 'int'},
                 { name: 'plannedDelivered', type: 'int'},
                 { name: 'unplannedCommitted', type: 'int'},
@@ -725,12 +733,13 @@ console.log(detailsStore);
                 }
             ]
         });
+        this.down('#middlebox').removeAll();
         this.down('#middlebox').add( {
             xtype: 'gridpanel',
             margin: '10 0 50 0',
             store: detailsStore,
             columns: [
-                { text: 'Release', dataIndex: 'release', flex: 1 },
+                { text: this.getSetting('timeboxType'), dataIndex: 'timeboxName', flex: 1 },
                 { text: 'Planned Committed', dataIndex: 'plannedCommitted', width: 150 },
                 { text: 'Planned Delivered', dataIndex: 'plannedDelivered', width: 150 },
                 { text: 'Unplanned Committed', dataIndex: 'unplannedCommitted', width: 150 }, 
@@ -740,7 +749,7 @@ console.log(detailsStore);
     },
 
     isPiTypeSelected: function() {
-        return this.modelName == this.lowestPiType.get('TypePath');
+        return (this.lowestPiType !== undefined) && (this.modelName == this.lowestPiType.get('TypePath'));
     },
 
     getConfigItems: function() {
@@ -865,7 +874,28 @@ console.log(detailsStore);
                         }
                     }
                 }
-            }, {
+            },{
+                xtype: 'rallynumberfield',
+                name: 'acceptWindow',
+                value: this.getSetting('acceptWindow'),
+                fieldLabel: 'Post timebox accept window (days)',
+                labelWidth: 150,
+                minValue: 0,
+                allowDecimals: false,
+                listeners: {
+                    scope: this,
+                    change: function(field, newValue, oldValue) {
+                        if (newValue != oldValue) {
+                            this.updateSettingsValues({
+                                settings: {
+                                    acceptWindow: newValue
+                                }
+                            });
+                        }
+                    }
+                }
+            }, 
+            {
                 xtype: 'rallycheckboxfield',
                 name: 'currentTimebox',
                 value: this.getSetting('currentTimebox'),
